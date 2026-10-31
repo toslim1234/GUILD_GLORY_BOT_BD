@@ -1,3 +1,5 @@
+
+
 MESSAGE_ID_TO_NAME = {
     0: "INVALID_MESSAGE_ID",
     1: "UDP_HELLO",
@@ -1883,3 +1885,7 @@ MESSAGE_ID_TO_NAME = {
     3585: "RUDP_S2C_REMOVE_TELEPORT_DOORS",
     3586: "RUDP_S2C_SubgameLobbyLW_BattleFenceState",
 }
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║   End of file  —  RAFIN TxT  —  Premium Edition                      ║
+# ╚══════════════════════════════════════════════════════════════════════╝
