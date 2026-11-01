@@ -46,19 +46,21 @@ INDEX_HTML_PATH = "MAX/index.html"
 START_MATCH_INTERVAL = 3.0
 NEW_MATCH_DELAY = 2.0
 MAX_MATCH_DURATION = 1500
-MATCH_IDLE_TIMEOUT  = 35.0
+MATCH_IDLE_TIMEOUT  = 120.0     # was 35s → bots abandoned matches too early (no glory)
+DEAD_GRACE          = 25.0      # after DEAD, stay in match so server credits rewards
 
 NO_MATCH_RESTART_ENABLED  = True
-NO_MATCH_RESTART_TIMEOUT  = 90.0
-NO_MATCH_RESTART_GRACE    = 60.0
+NO_MATCH_RESTART_TIMEOUT  = 180.0   # was 90s → full execv restart was too frequent
+NO_MATCH_RESTART_GRACE    = 120.0   # was 60s → boot/login time needs more room
 
 _accept_friend_request = True
 DEBUG_ALL_PACKETS = False
 
 TEAM_MODE = True
-TEAM_SIZE = 4
-TEAM_READY_DELAY = 5.0
-TEAM_INVITE_WAIT = 2.5
+TEAM_SIZE = 4                  # max members in ONE squad (game limit)
+TEAM_READY_DELAY = 3.0
+TEAM_INVITE_WAIT = 1.8
+TEAM_WAIT_MAX = 15.0           # max wait for peers before starting with fewer
 CLAN_ID_DEFAULT = "3105712089"
 DEV_UID = ""
 
@@ -272,14 +274,29 @@ class BotState:
             "uptime_seconds": existing.get("uptime_seconds", 0),
             "last_match_time": existing.get("last_match_time", "Running..."),
             "is_paused": False,
+            "status_since": time.time(),
         }
 
     def update_status(self, uid, status, matches=0):
         uid = str(uid)
         if uid in self.accounts:
-            self.accounts[uid]["status"] = status
-            self.accounts[uid]["active_matches"] = matches
-            self.accounts[uid]["is_paused"] = (status == "PAUSED")
+            a = self.accounts[uid]
+            if a.get("status") != status:
+                a["status_since"] = time.time()
+            a["status"] = status
+            a["active_matches"] = matches
+            a["is_paused"] = (status == "PAUSED")
+
+    def stale_in_match_bots(self, limit_sec=0.0):
+        """UIDs stuck in IN_MATCH longer than limit_sec (default MAX_MATCH_DURATION+180)."""
+        now = time.time()
+        if limit_sec <= 0: limit_sec = MAX_MATCH_DURATION + 180.0
+        out = []
+        for uid, a in self.accounts.items():
+            if "IN_MATCH" not in str(a.get("status", "")).upper(): continue
+            if now - float(a.get("status_since", now)) > limit_sec:
+                out.append(str(uid))
+        return out
 
     def update_exp(self, uid, exp, level=None):
         uid = str(uid)
@@ -330,19 +347,19 @@ _team_state = {"peers": {}, "leader_uid": None, "team_code": None, "lock": async
 _restart_state = {"lock": asyncio.Lock(), "finished_bots": set(), "target": None, "restarting": False}
 
 async def _mark_bot_match_finished(account_id):
+    """Round tracker only. Bots now loop matches continuously, so we never
+    restart the whole process after a round (that was the old stall cause)."""
     async with _restart_state["lock"]:
-        if _restart_state["restarting"]: return
         _restart_state["finished_bots"].add(str(account_id))
+        target = _squad_target()
+        _restart_state["target"] = target
         n_done = len(_restart_state["finished_bots"])
-        if _restart_state["target"] is None:
-            active_ids = {uid for uid, a in bot_state.accounts.items() if a.get("status") not in ("OFFLINE",)}
-            _restart_state["target"] = max(1, min(TEAM_SIZE, len(active_ids))) if active_ids else TEAM_SIZE
-        target = _restart_state["target"]
-        print_success(f"[RESTART] {account_id} → {n_done}/{target}")
+        print_success(f"[MATCH] {account_id} finished → {n_done}/{target} this round")
         if n_done >= target:
-            _restart_state["restarting"] = True
-            print_warning(f"[RESTART] ✅ All {target} bots done! Restart in 3s...")
-            asyncio.create_task(_schedule_restart())
+            _restart_state["finished_bots"].clear()
+            _restart_state["target"] = None
+            print_premium(f"[MATCH] Round complete {target}/{target} → next round (no restart)",
+                          color=PX.EMERALD, icon=I["rocket"])
 
 _no_match_state = {"lock": asyncio.Lock(), "global_last_match": None, "restart_triggered": False}
 async def _mark_match_found(account_id=None):
@@ -369,11 +386,26 @@ async def _team_member_count() -> int:
     async with _team_state["lock"]:
         return len(_team_state["peers"])
 
+def _squad_target() -> int:
+    """Expected squad size (P0-1 FIX).
+
+    OLD: hard-coded TEAM_SIZE — a 2 or 3 bot setup (or a single failed login
+    out of 4) waited forever for a 4th peer and never started a match.
+    NEW: never more than TEAM_SIZE, never more than the bots we really have.
+    """
+    try:
+        n = sum(1 for a in bot_state.accounts.values()
+                if str(a.get("status", "")).upper() not in ("OFFLINE", "PAUSED", ""))
+    except Exception:
+        n = 0
+    return max(1, min(TEAM_SIZE, n))
+
 def _all_bots_are_online_or_searching() -> bool:
     active_statuses = []
     for uid, acc in bot_state.accounts.items():
         status = str(acc.get("status", "")).upper().strip()
-        if status in ("", "OFFLINE"): continue
+        # PAUSED = user intent, must never block the watchdog forever
+        if status in ("", "OFFLINE", "PAUSED"): continue
         active_statuses.append(status)
     if not active_statuses: return False
     return all(st in _ALLOWED_RESTART_STATUSES for st in active_statuses)
@@ -395,6 +427,18 @@ async def _no_match_watchdog():
         try:
             if _restart_state["restarting"]: return
             if _no_match_state["restart_triggered"]: return
+
+            # A match task that died but never cleared its IN_MATCH status used to
+            # neuter this watchdog forever. Force a restart in that case.
+            stale = bot_state.stale_in_match_bots()
+            if stale:
+                msg = (f"[NO-MATCH] stale IN_MATCH > {MAX_MATCH_DURATION + 180:.0f}s "
+                       f"for {','.join(stale)} → force restart")
+                print_warning(msg); bot_state.log(msg, "warning")
+                async with _restart_state["lock"]:
+                    _restart_state["restarting"] = True
+                await _schedule_restart(); return
+
             if _any_bot_in_match():
                 async with _no_match_state["lock"]:
                     _no_match_state["global_last_match"] = time.time()
@@ -414,7 +458,7 @@ async def _no_match_watchdog():
                         del _team_stuck_state["in_team_since"][uid]; continue
                     if now - since >= NO_MATCH_RESTART_TIMEOUT:
                         stuck_uids.append((uid, now - since))
-            if stuck_uids and team_size >= TEAM_SIZE and not _any_bot_in_match():
+            if stuck_uids and team_size >= _squad_target() and not _any_bot_in_match():
                 async with _team_stuck_state["lock"]:
                     if _team_stuck_state["triggered"]: continue
                     _team_stuck_state["triggered"] = True
@@ -1713,6 +1757,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
     movement_ctrl = None
     uid_str = str(account_id)
     completed_cleanly = False
+    died = False; dead_at = 0.0
     try:
         ip, port = server_ip_port.split(":")
         port = int(port)
@@ -1769,9 +1814,26 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     frame = await decode_packet(response, udp_key_bytes, match_code)
                     if frame:
                         ptype = await classify(frame)
-                        if frame['cmd'] in [103, 107]:
-                            print_premium(f"Match #{match_index} END", color=PX.MAGENTA, icon=I["star"])
+                        if frame['cmd'] == 103:
+                            print_premium(f"Match #{match_index} MATCH_END (clean)",
+                                          color=PX.MAGENTA, icon=I["star"])
                             completed_cleanly = True; local_closed = True
+                            continue
+                        if frame['cmd'] == 107:
+                            # ── GLORY FIX ──
+                            # Old code closed the UDP socket the instant the player
+                            # died, so the server never credited the match.
+                            # Now we hold the connection for DEAD_GRACE seconds.
+                            if not died:
+                                died = True; dead_at = time.time()
+                                print_premium(
+                                    f"Match #{match_index} DEAD → holding {DEAD_GRACE:.0f}s for rewards",
+                                    color=PX.ROSE, icon="⚑")
+                                if movement_ctrl:
+                                    try: await movement_ctrl.stop()
+                                    except Exception: pass
+                            if time.time() - dead_at >= DEAD_GRACE:
+                                completed_cleanly = True; local_closed = True
                             continue
                         if frame['cmd'] == 101:
                             try:
@@ -1815,7 +1877,9 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     if (time.time() - match_start_time) > 25.0:
                         print_warning(f"Match #{match_index} Handshake timeout"); break
                 elif ack_state == "thunder_sharma_sent":
-                    if (time.time() - last_activity) > MATCH_IDLE_TIMEOUT:
+                    if died and (time.time() - dead_at) >= DEAD_GRACE:
+                        completed_cleanly = True; local_closed = True
+                    elif (time.time() - last_activity) > MATCH_IDLE_TIMEOUT:
                         completed_cleanly = True; break
             except (BlockingIOError, OSError):
                 await asyncio.sleep(0.5); continue
@@ -1968,18 +2032,53 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
     async def _team_coordinator():
         try:
+            loop_t = asyncio.get_running_loop()
+            wait_start = loop_t.time()
+            # ── P0-1 FIX ────────────────────────────────────────────────────
+            # OLD: `if n >= TEAM_SIZE: break` → 2/3 bot setups (or one failed
+            # login out of 4) waited forever, so not a single match ever ran.
+            # NEW: wait for the squad we really have, and never longer than
+            # TEAM_WAIT_MAX — then start with whoever is connected.
             while True:
                 async with _team_state["lock"]:
                     n = len(_team_state["peers"])
+                elapsed = loop_t.time() - wait_start
                 if n >= TEAM_SIZE: break
+                if elapsed >= TEAM_WAIT_MAX: break
+                if n >= 2 and n >= _squad_target(): break
                 if bot_state.is_paused(uid_str): return
                 await asyncio.sleep(0.5)
             await asyncio.sleep(TEAM_READY_DELAY)
+            # ── P0-3 / P1-7 FIX ─────────────────────────────────────────────
+            # Deterministic leader = lowest UID among live peers, and if the
+            # leader disappears somebody takes over instead of dead-locking.
             async with _team_state["lock"]:
+                peers_now = sorted(_team_state["peers"].keys())
+                if not peers_now: return
+                if _team_state["leader_uid"] not in peers_now:
+                    _team_state["leader_uid"] = peers_now[0]
+                    print_premium(f"TEAM leader elected → {peers_now[0]}",
+                                  color=PX.GOLD, icon=I["crown"])
                 is_leader = (_team_state["leader_uid"] == uid_str)
                 peers_snapshot = dict(_team_state["peers"])
             if not is_leader:
-                print_info(f"TEAM {uid_str} waiting as member..."); return
+                # Stay alive as a member so we can take over if the leader dies.
+                print_info(f"TEAM {uid_str} waiting as member "
+                           f"(leader={_team_state['leader_uid']})...")
+                while _team_active["flag"] and not _match_played["flag"]:
+                    if bot_state.is_paused(uid_str): return
+                    async with _team_state["lock"]:
+                        peers_now = sorted(_team_state["peers"].keys())
+                        if _team_state["leader_uid"] not in peers_now:
+                            _team_state["leader_uid"] = peers_now[0] if peers_now else None
+                        is_leader = (_team_state["leader_uid"] == uid_str)
+                    if is_leader:
+                        print_warning(f"TEAM leader lost → {uid_str} taking over squad")
+                        break
+                    await asyncio.sleep(1.0)
+                if not is_leader: return
+                async with _team_state["lock"]:
+                    peers_snapshot = dict(_team_state["peers"])
             print_premium(f"TEAM {uid_str} — creating squad region={account_region}",
                           color=PX.GOLD, icon=I["crown"])
             async with _team_state["lock"]:
@@ -2025,7 +2124,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                               color=PX.CYAN, icon=I["arrow"])
                 await _invite_uid(int(peer_acc_id), f" bot{invite_count+2}")
                 invite_count += 1
-            await asyncio.sleep(TEAM_INVITE_WAIT + 3.0)
+            await asyncio.sleep(TEAM_INVITE_WAIT + 1.5)
             try:
                 pkt = team_fresh(int(own_id_num), current_key, current_iv)
                 if _writer_ref["w"] and not _writer_ref["w"].is_closing():
@@ -2061,7 +2160,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
     async def _member_match_trigger():
         try:
-            await asyncio.sleep(TEAM_READY_DELAY + 18.0)
+            await asyncio.sleep(TEAM_READY_DELAY + 8.0)
             async with _team_state["lock"]:
                 if _team_state["leader_uid"] == uid_str: return
             print_premium(f"TEAM Member {uid_str} ready loop",
@@ -2167,24 +2266,18 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                         await start_game_battle_royale(account_region, client_version, writer, current_key, current_iv)
                     except Exception as e: print_warning(f"Solo: {e}")
 
-                if not _match_played["flag"]:
-                    if not TEAM_MODE: await send_solo_start_match()
-                    if TEAM_MODE:
-                        team_coord_task = asyncio.create_task(_team_coordinator())
-                        member_trigger_task = asyncio.create_task(_member_match_trigger())
-                else:
-                    print_info(f"IDLE {uid_str} resuming in idle mode")
+                # Safety: a stale "parked" state must never block searching again
+                if _match_played["flag"]:
+                    _match_played["flag"] = False
+                    _team_active["flag"] = True
+                if not TEAM_MODE: await send_solo_start_match()
+                if TEAM_MODE:
+                    team_coord_task = asyncio.create_task(_team_coordinator())
+                    member_trigger_task = asyncio.create_task(_member_match_trigger())
 
                 while True:
                     play_matches[:] = [m for m in play_matches if not m.done()]
                     if bot_state.is_paused(uid_str): break
-                    if _match_played["flag"]:
-                        try: data = await asyncio.wait_for(reader.read(8192), timeout=1.0)
-                        except asyncio.TimeoutError: continue
-                        if not data: raise ConnectionError("Connection closed")
-                        if len(data) > 20 and data.hex().startswith("0600"):
-                            await _process_social_packet(data, tag="IDLE")
-                        continue
                     now = asyncio.get_running_loop().time()
                     if not TEAM_MODE and len(play_matches) == 0 and (now - last_start_time >= START_MATCH_INTERVAL):
                         await send_solo_start_match()
@@ -2285,7 +2378,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                 print_info(f"Match #{match_index} → {server_ip_port}")
                                 try:
                                     bot_state.increment_match_started()
-                                    bot_state.update_status(uid_str, "IN_MATCH (TEAM)", 1)
+                                    bot_state.update_status(uid_str, "IN_MATCH", 1)
                                 except Exception: pass
                                 new_match = asyncio.create_task(
                                     play_game(server_ip_port, thunder, sharma, udp_key,
@@ -2312,11 +2405,32 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                     try: await drain_task
                                     except asyncio.CancelledError: pass
                                 play_matches[:] = [m for m in play_matches if not m.done()]
-                                _match_played["flag"] = True
-                                print_premium(f"IDLE {uid_str} parked after match",
-                                              color=PX.SLATE, icon=I["dot"])
-                                continue
-                        except Exception as e: print_warning(f"MATCH {e}"); continue
+                                # ── CONTINUOUS PLAY FIX ─────────────────────────────
+                                # OLD (bug): _match_played = True → bot parked forever,
+                                # only a full process restart started the next match.
+                                # NEW: re-arm instantly and cycle the gateway connection.
+                                _match_played["flag"] = False
+                                _team_active["flag"] = True
+                                try: await _clear_team_joined(uid_str)
+                                except Exception: pass
+                                print_premium(f"[MATCH] {uid_str} done → re-arming match search",
+                                              color=PX.EMERALD, icon=I["rocket"])
+                                await asyncio.sleep(2.0)
+                                break
+                        except Exception as e: print_warning(f"MATCH {e}")
+                        # ── P0-2 FIX ────────────────────────────────────────
+                        # The search tasks above are already cancelled. On any
+                        # parse/startup failure we must NOT `continue` — the bot
+                        # would stay online but never search again (dead until a
+                        # full process restart). Cycling the connection re-creates
+                        # the team tasks and re-arms the match search.
+                        print_warning(f"[MATCH] {uid_str} start failed → reconnect to re-arm")
+                        _match_played["flag"] = False
+                        _team_active["flag"] = True
+                        try: await _clear_team_joined(uid_str)
+                        except Exception: pass
+                        await asyncio.sleep(1.0)
+                        break
                     if 30 <= packet_length <= 40: continue
             except asyncio.CancelledError: raise
             except Exception as e:
@@ -2842,6 +2956,61 @@ async def _autoload_accounts():
         except Exception as e:
             print_error(f"[BOOT] worker {i+1}: {e}")
 
+# ==================== ACCOUNT PERSISTENCE (P1-5 / P1-6 FIX) ====================
+# OLD: accounts added from the dashboard only lived in memory, so any process
+# restart (watchdog / execv) made them disappear. Deleting an account never
+# touched accounts.json either, so deleted bots came back after a restart.
+def _persist_account(uid, password, region=None, clan_id=None):
+    uid = str(uid or "").strip()
+    if not uid or not password: return False
+    rows = []
+    if os.path.exists(ACCOUNTS_FILE):
+        try:
+            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                rows = json.load(f) or []
+            if not isinstance(rows, list): rows = []
+        except Exception:
+            rows = []
+    found = False
+    for r in rows:
+        if isinstance(r, dict) and str(r.get("uid")) == uid:
+            r["password"] = str(password)
+            if region: r["region"] = str(region)
+            if clan_id: r["clan_id"] = str(clan_id)
+            found = True
+            break
+    if not found:
+        row = {"uid": uid, "password": str(password)}
+        if region: row["region"] = str(region)
+        if clan_id: row["clan_id"] = str(clan_id)
+        rows.append(row)
+    try:
+        with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(rows, f, indent=2)
+        print_info(f"[STORE] accounts.json → saved {uid}")
+        return True
+    except Exception as e:
+        print_warning(f"[STORE] accounts.json save failed: {e}")
+        return False
+
+def _persist_remove_account(*uids):
+    targets = {str(u).strip() for u in uids if str(u or "").strip()}
+    if not targets or not os.path.exists(ACCOUNTS_FILE): return False
+    try:
+        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            rows = json.load(f) or []
+        if not isinstance(rows, list): return False
+        kept = [r for r in rows
+                if not (isinstance(r, dict) and str(r.get("uid")) in targets)]
+        if len(kept) == len(rows): return False
+        with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(kept, f, indent=2)
+        print_info(f"[STORE] accounts.json → removed {', '.join(sorted(targets))}")
+        return True
+    except Exception as e:
+        print_warning(f"[STORE] accounts.json remove failed: {e}")
+        return False
+
 # ==================== HTTP SERVER ====================
 @aiohttp.web.middleware
 async def _req_logger(request, handler):
@@ -2877,7 +3046,9 @@ async def api_ping(request):
 async def api_stats(request):
     try:
         accs = list(bot_state.accounts.values())
-        online = sum(1 for a in accs if a.get("status") in ("ONLINE","IN_MATCH","SEARCHING"))
+        online = sum(1 for a in accs
+                     if str(a.get("status", "")).upper() in ("ONLINE", "SEARCHING")
+                     or "IN_MATCH" in str(a.get("status", "")).upper())
         active_matches = sum(a.get("active_matches", 0) for a in accs)
         uptime = max(1, int(time.time() - bot_state.start_time))
         uptime_h = max(0.016, uptime / 3600.0)
@@ -2972,6 +3143,10 @@ async def api_account_add(request):
         password = str(body.get("password", "")).strip()
         if not uid or not password:
             return aiohttp.web.json_response({"status": "error", "error": "uid/password required"})
+        # persist first so a restart (watchdog/execv) re-loads this account
+        _persist_account(uid, password, body.get("region"), body.get("clan_id"))
+        if uid in bot_state.account_workers and not bot_state.account_workers[uid].done():
+            return aiohttp.web.json_response({"status": "ok", "msg": "already running"})
         asyncio.create_task(account_loop_guest(uid, password))
         return aiohttp.web.json_response({"status": "ok"})
     except Exception as e:
@@ -2982,6 +3157,12 @@ async def api_account_delete(request):
         body = await request.json()
         uid = str(body.get("uid", "")).strip()
         auth_uid = str(body.get("auth_uid", "")).strip()
+        # resolve the login uid so accounts.json stays in sync (P1-6 FIX)
+        acc = bot_state.accounts.get(uid) if uid else None
+        if not auth_uid and isinstance(acc, dict) and acc.get("auth_uid"):
+            auth_uid = str(acc["auth_uid"])
+        if not auth_uid and uid in bot_state.game_to_auth_id:
+            auth_uid = str(bot_state.game_to_auth_id[uid])
         for u in {uid, auth_uid} - {""}:
             if u in bot_state.account_workers:
                 try: bot_state.account_workers[u].cancel()
@@ -2990,6 +3171,7 @@ async def api_account_delete(request):
             if u in bot_state.accounts: del bot_state.accounts[u]
             cache_invalidate(u)
             bot_state.toggle_pause(u, False)
+        _persist_remove_account(uid, auth_uid)
         return aiohttp.web.json_response({"status": "ok"})
     except Exception as e:
         return aiohttp.web.json_response({"status": "error", "error": str(e)})
