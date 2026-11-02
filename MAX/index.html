@@ -828,7 +828,7 @@ body.c-down .c-ring{width:24px;height:24px;background:color-mix(in srgb,var(--em
       </div>
       <div class="two">
         <div class="field"><label for="teamCount">Bot Count</label><select id="teamCount"><option value="4" selected>4 bots (full squad)</option><option value="3">3 bots</option><option value="2">2 bots</option></select></div>
-        <div class="field"><label for="teamPass">Password</label><input id="teamPass" type="text" value=" GLORY"></div>
+        <div class="field"><label for="teamPass">Password</label><input id="teamPass" type="text" value="GLORY"></div>
       </div>
       <div class="card-actions"><button type="button" class="btn" data-close="teamModal">Cancel</button><button type="submit" class="btn ok" id="teamSubmit"><i class="fa-solid fa-bolt"></i>Create & Start</button></div>
     </form>
@@ -1303,7 +1303,7 @@ $("addForm").addEventListener("submit", e => {
 /* ============ TEAM ============ */
 $("teamForm").addEventListener("submit", e => {
   e.preventDefault();
-  const region = $("teamRegion").value, clan_id = $("teamClan").value.trim(), count = parseInt($("teamCount").value, 10), password = $("teamPass").value.trim() || " GLORY";
+  const region = $("teamRegion").value, clan_id = $("teamClan").value.trim(), count = parseInt($("teamCount").value, 10), password = $("teamPass").value.trim() || "GLORY";
   if (!clan_id) return toast("Clan ID is required", "error");
   guard("team", async () => {
     const b = $("teamSubmit"); b.disabled = true; const old = b.innerHTML;
@@ -1315,6 +1315,9 @@ $("teamForm").addEventListener("submit", e => {
         toast(`Creating ${count} bots in ${region}...`, "success");
         addNotification("Create Team", `${count} new bots in ${region}`, "success");
         [3000, 8000, 15000].forEach(ms => setTimeout(fetchStats, ms));
+      } else if (d && d.error) {
+        toast(d.error, "error");
+        soundError();
       } else {
         closeModal("teamModal");
         toast("(demo) Team creation started locally", "info");

@@ -21,6 +21,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from protobuf_decoder.protobuf_decoder import Parser
 from message_ids import MESSAGE_ID_TO_NAME
+import device_profile as devprof
 import thunderFF_pb2
 
 try:
@@ -39,8 +40,9 @@ WEB_HOST = "0.0.0.0"
 WEB_PORT = 3007
 ACCOUNTS_FILE = "accounts.json"
 TOKEN_CACHE_FILE = "token_cache.json"
-DEVICES_FILE = "devices.json"
-TOKEN_CACHE_TTL = 1200
+DEVICES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "devices.json")
+TOKEN_CACHE_TTL = 1200          # per-entry TTL; refreshed on every profile sync
 INDEX_HTML_PATH = "MAX/index.html"
 
 START_MATCH_INTERVAL = 3.0
@@ -523,37 +525,14 @@ def _encode_proto_std(fields):
     return out
 
 # ==================== DEVICE ====================
+# Phase A1: device identity lives in device_profile.py and is persisted per
+# auth_uid in devices.json. These two helpers are kept as thin aliases because
+# older code paths still reference them.
 def _generate_new_device() -> dict:
-    device_list = [
-        ("Samsung","SM-G998B","Adreno (TM) 660","Android OS 12 / API-31"),
-        ("Xiaomi","2201122G","Adreno (TM) 730","Android OS 13 / API-33"),
-        ("Realme","RMX3700","Mali-G710","Android OS 14 / API-34"),
-        ("OnePlus","CPH2451","Adreno (TM) 740","Android OS 13 / API-33"),
-        ("OPPO","CPH2611","Adreno (TM) 720","Android OS 14 / API-34"),
-    ]
-    brand, model, gpu, os_ver = random.choice(device_list)
-    return {"unique_device_id":f"Google|{uuid.uuid4()}","brand":brand,"model":model,
-            "gpu_renderer":gpu,"system_software":os_ver,
-            "screen_width":random.choice([1080,1440,720]),
-            "screen_height":random.choice([2400,3200,1600]),
-            "screen_dpi":str(random.randint(300,420)),
-            "memory":random.randint(2800,6500)}
+    return devprof.new_profile()
 
 def get_device_for_account(acc_key: str) -> dict:
-    devices = {}
-    if os.path.exists(DEVICES_FILE):
-        try:
-            with open(DEVICES_FILE,"r",encoding="utf-8") as f:
-                devices = json.load(f)
-                if not isinstance(devices, dict): devices = {}
-        except Exception: devices = {}
-    if acc_key in devices: return devices[acc_key]
-    nd = _generate_new_device(); devices[acc_key] = nd
-    try:
-        with open(DEVICES_FILE,"w",encoding="utf-8") as f:
-            json.dump(devices, f, indent=2)
-    except Exception: pass
-    return nd
+    return devprof.get_or_create(acc_key)
 
 def encode_f14(s):
     ks = [0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,
@@ -1157,10 +1136,12 @@ async def version_config(region="ID"):
     except Exception as e:
         print_error(f"[VERCONFIG] {e}"); return None
 
-async def get_access_token(uid, password):
+async def get_access_token(uid, password, device=None):
     url = "https://100067.connect.garena.com/oauth/guest/token/grant"
+    ua = (devprof.ua_dalvik(device) if device
+          else "Dalvik/2.1.0 (Linux; U; Android 12; SM-G998B)")
     hdrs = {"Host":"100067.connect.garena.com",
-        "User-Agent":"Dalvik/2.1.0 (Linux; U; Android 12; SM-G998B)",
+        "User-Agent":ua,
         "Content-Type":"application/x-www-form-urlencoded",
         "Accept-Encoding":"gzip, deflate, br","Connection":"close"}
     data = {"uid":str(uid),"password":password,"response_type":"token","client_type":"2",
@@ -1179,13 +1160,15 @@ async def get_access_token(uid, password):
 def generate_signature(payload_str):
     return hmac.new(API_KEY, payload_str.encode(), hashlib.sha256).hexdigest()
 
-async def register_account(password, gop_url, app_version):
+async def register_account(password, gop_url, app_version, device=None):
     connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
     rp = {"app_id":100067,"client_type":2,"password":password,"source":2}
     payload = json.dumps(rp, separators=(',',':'))
     sig = generate_signature(payload)
+    ua = (devprof.ua_msdk(device, app_version) if device
+          else f"GarenaMSDK/4.0.44(SM-E135F ;Android 14;en;GB;app {app_version} 2019118525;)")
     headers = {
-        "User-Agent": f"GarenaMSDK/4.0.44(SM-E135F ;Android 14;en;GB;app {app_version} 2019118525;)",
+        "User-Agent": ua,
         "Authorization": f"Signature {sig}",
         "Accept": "application/json",
         "Content-Type": "application/json; charset=utf-8"}
@@ -1199,15 +1182,19 @@ async def register_account(password, gop_url, app_version):
     except Exception as e: print_error(f"[REGISTER] {e}")
     return None
 
-async def grant_token(uid, password, gop_url, app_version):
+async def grant_token(uid, password, gop_url, app_version, device=None):
     connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
+    garena_id = (devprof.garena_device_id(device) if device
+                 else f"02-{uuid.uuid4()}")
     gp = {"client_id":100067,"client_secret":HEX_KEY,"client_type":2,
-          "device_id":f"02-{uuid.uuid4()}","password":password,
+          "device_id":garena_id,"password":password,
           "response_type":"token","uid":int(uid)}
     payload = json.dumps(gp, separators=(',',':'))
     sig = generate_signature(payload)
+    ua = (devprof.ua_msdk(device, app_version) if device
+          else f"GarenaMSDK/4.0.44(SM-E135F ;Android 14;en;GB;app {app_version} 2019118525;)")
     headers = {
-        "User-Agent": f"GarenaMSDK/4.0.44(SM-E135F ;Android 14;en;GB;app {app_version} 2019118525;)",
+        "User-Agent": ua,
         "Authorization": f"Signature {sig}",
         "Accept": "application/json",
         "Content-Type": "application/json; charset=utf-8"}
@@ -1222,8 +1209,10 @@ async def grant_token(uid, password, gop_url, app_version):
     return None
 
 # ==================== PAYLOAD ====================
-async def get_payload(access_token, open_id, platform, version, lang_code="en"):
-    device_id = f"Google|{uuid.uuid4()}"
+async def get_payload(access_token, open_id, platform, version, lang_code="en",
+                      device=None):
+    device_id = (devprof.google_device_id(device) if device
+                 else f"Google|{uuid.uuid4()}")
     major_login = {
         "3": str(datetime.now())[:-7], "4": "free fire", "5": 1, "7": f"{version}",
         "8": "Android OS 14 / API-34 (UP1A.231005.007/E135FXXSEEZE2)",
@@ -2435,7 +2424,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
             except asyncio.CancelledError: raise
             except Exception as e:
                 if "Cache expired" in str(e):
-                    print_warning(f"Token expired {uid_str}"); break
+                    print_warning(f"Token expired {uid_str} → full re-login"); break
                 reconnects += 1
                 if reconnects > max_reconnects:
                     if current_account_data:
@@ -2550,6 +2539,15 @@ async def refresh_account_profile(ad_or_uid):
         if not (token and acc_id and srv and rel): return
         data = await get_player_personal_show(int(acc_id), token, srv, rel)
         if not data: return
+        # ── SLIDING TOKEN CACHE (fix: "Token expired" every 20 min) ──────────
+        # cached_at used to be written only at login, so every 20 minutes the
+        # reconnect path forced a full re-login in the middle of a match round.
+        # Touching the entry on every successful profile sync keeps the fast
+        # cache path alive; a genuinely dead JWT still fails the TCP connect
+        # and gets invalidated by the max_reconnects path.
+        if ad.get('auth_uid'):
+            try: cache_set(str(ad['auth_uid']), ad)
+            except Exception: pass
         pd = data.get(1, {}) if isinstance(data.get(1), dict) else {}
         nickname = pd.get(3); lvl = pd.get(6); exp = pd.get(7)
         if exp is None: return
@@ -2575,6 +2573,10 @@ async def process_account_uid_pass(uid, password, region_override=None):
         aid = str(cached['account_id'])
         nick = cached.get('nickname', f"Player_{aid}")
         lvl = cached.get('level', 1); expv = cached.get('exp', 0)
+        try:
+            dev = devprof.bind_account(uid, account_id=aid)
+            print_info(f"[DEV] {uid} → {devprof.summary(dev)} (cache)")
+        except Exception as e: print_warning(f"[DEV] {e}")
         print_premium(f"Online (cache): {aid} | {nick} | region={cached.get('region','BD')}",
                       color=PX.MINT, icon=I["check"])
         bot_state.register_account(aid, nick, cached.get('region','BD'),
@@ -2582,15 +2584,18 @@ async def process_account_uid_pass(uid, password, region_override=None):
         _register_credentials(cached); return cached
     print_info(f"LOGIN UID: {uid}")
     try:
+        try: device = devprof.get_or_create(uid)
+        except Exception as e:
+            print_warning(f"[DEV] {e}"); device = None
         async with _LOGIN_SEMAPHORE:
             vc = await version_config(region_override or "ID")
             if not vc: return None
             release_version, client_version, server_url, gop_1, app_version = vc
-            tg = await get_access_token(uid, password)
+            tg = await get_access_token(uid, password, device=device)
             if not tg: return None
             open_id, access_token, platform = tg
             major_payload, login_payload = await get_payload(
-                access_token, open_id, platform, client_version)
+                access_token, open_id, platform, client_version, device=device)
             res_json = await major_login(major_payload, server_url, release_version)
             if not res_json: return None
             def _gd(k):
@@ -2617,6 +2622,10 @@ async def process_account_uid_pass(uid, password, region_override=None):
         bot_state.register_account(acc_id, nickname, region, level, exp, likes, auth_uid=str(uid))
         print_premium(f"Login: {acc_id} | {nickname} | Lvl {level} | region={region}",
                       color=PX.GOLD, icon=I["gem"])
+        try:
+            device = devprof.bind_account(uid, device, account_id=acc_id)
+            print_info(f"[DEV] {uid} → {devprof.summary(device)}")
+        except Exception as e: print_warning(f"[DEV] {e}")
         ad = {'account_id':acc_id_raw,'nickname':nickname,'region':region,
             'level':level,'exp':exp,'likes':likes,'open_id':open_id,
             'access_token':access_token,'platform':str(platform),
@@ -2644,7 +2653,16 @@ async def run_account_worker(ad, label, region_override=None, clan_override=None
         if clan_override:
             try:
                 await asyncio.sleep(1.0)
-                await join_clan(ad['token'], clan_override)
+                joined = False
+                for attempt in range(3):
+                    joined = await join_clan(ad['token'], clan_override)
+                    if joined: break
+                    await asyncio.sleep(2.0)
+                if joined:
+                    print_success(f"CLAN {clan_override} join request accepted")
+                else:
+                    print_warning(f"CLAN {clan_override} join FAILED 3x → "
+                                  f"matches may earn NO glory (clan approval/region?)")
             except Exception as e: print_warning(f"CLAN {e}")
         info_task = asyncio.create_task(informational(
             ad['informational_addrs'], tcp_chat, ad['aes_ak'], ad['iv_i'],
@@ -2794,16 +2812,24 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
         for i in range(count):
             _prog(f"Creating bot {i+1}/{count}...")
             try:
-                uid = await register_account(password, gop_1, app_version)
+                device = devprof.new_profile()
+                uid = await register_account(password, gop_1, app_version,
+                                             device=device)
                 if not uid:
                     _prog(f"bot {i+1}: register failed"); continue
-                tok = await grant_token(uid, password, gop_1, app_version)
+                try:
+                    device = devprof.bind_account(uid, device)
+                    print_info(f"[DEV] {uid} → {devprof.summary(device)}")
+                except Exception as e: print_warning(f"[DEV] {e}")
+                tok = await grant_token(uid, password, gop_1, app_version,
+                                        device=device)
                 if not tok:
                     _prog(f"bot {i+1}: grant failed"); continue
                 open_id = tok["open_id"]; access_token = tok["access_token"]
                 platform = tok.get("platform", 4)
                 major_payload, login_payload = await get_payload(
-                    access_token, open_id, platform, game_version, lang)
+                    access_token, open_id, platform, game_version, lang,
+                    device=device)
                 nickname_final = "BRX•" + "".join(
                     random.choices(string.ascii_uppercase + string.digits, k=5))
                 mr = await major_register(release_v, access_token, open_id,
@@ -2814,7 +2840,8 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                 res_json = None
                 for attempt in range(3):
                     mp, lp = await get_payload(
-                        access_token, open_id, platform, game_version, lang)
+                        access_token, open_id, platform, game_version, lang,
+                        device=device)
                     res_json = await major_login(mp, login_url, release_v)
                     if res_json and (("8" in res_json) or (8 in res_json)):
                         login_payload = lp; break
@@ -2841,7 +2868,8 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                     res_json2 = None
                     for attempt in range(3):
                         mp2, lp2 = await get_payload(
-                            access_token, open_id, platform, game_version, lang)
+                            access_token, open_id, platform, game_version, lang,
+                            device=device)
                         res_json2 = await major_login(mp2, login_url, release_v)
                         if res_json2 and (("10" in res_json2) or (10 in res_json2)):
                             res_json = res_json2; login_payload = lp2; break
@@ -2878,6 +2906,10 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                     'auth_type': 'guest', 'auth_uid': uid, 'auth_password': password,
                 }
                 _register_credentials(ad); cache_set(uid, ad)
+                try:
+                    device = devprof.bind_account(uid, device,
+                                                 account_id=acc_id_raw)
+                except Exception as e: print_warning(f"[DEV] {e}")
                 created.append(ad)
                 _prog(f"bot {i+1}: {nickname_final} | UID {acc_id_raw} | region={region}")
                 await asyncio.sleep(0.6)
@@ -3121,6 +3153,9 @@ async def api_create_team(request):
         password = str(body.get("password", "BRX771")).strip() or "BRX771"
         if not clan_id:
             return aiohttp.web.json_response({"ok": False, "error": "clan_id required"})
+        if not clan_id.isdigit() or not (6 <= len(clan_id) <= 12):
+            return aiohttp.web.json_response(
+                {"ok": False, "error": "Clan ID must be numeric (6-12 digits)"})
         if bot_state.creating:
             return aiohttp.web.json_response({"ok": False, "error": "already creating"})
         count = max(1, min(4, count))
@@ -3243,6 +3278,11 @@ async def api_logs_clear(request):
 async def account_loop_token(token):
     print_info(f"TOKEN Login {token[:20]}...")
     try:
+        try:
+            device = devprof.get_or_create(f"tok_{token[:20]}")
+            print_info(f"[DEV] tok_{token[:20]} → {devprof.summary(device)}")
+        except Exception as e:
+            print_warning(f"[DEV] {e}"); device = None
         vc = await version_config("ID")
         if not vc: return
         release_version, client_version, server_url, gop_1, app_version = vc
@@ -3255,7 +3295,7 @@ async def account_loop_token(token):
         open_id = data.get('open_id'); platform = data.get('platform', 4)
         if not open_id: return
         major_payload, login_payload = await get_payload(
-            token, open_id, platform, client_version)
+            token, open_id, platform, client_version, device=device)
         res_json = await major_login(major_payload, server_url, release_version)
         if not res_json: return
         def _gd(k):
@@ -3285,9 +3325,42 @@ async def account_loop_token(token):
             'auth_type':'token','auth_token':token}
         _register_credentials(ad)
         cache_set(f"tok_{token[:20]}", ad)
+        try:
+            devprof.bind_account(f"tok_{token[:20]}", device,
+                                 account_id=acc_id_raw)
+        except Exception as e: print_warning(f"[DEV] {e}")
         await run_account_worker(ad, str(acc_id_raw))
     except Exception as e:
         print_error(f"TOKEN {e}")
+
+async def api_devices(request):
+    """Read-only view of the persisted device profiles (Phase A1 verification)."""
+    try:
+        profiles = devprof.all_profiles()
+        out = []
+        for uid, p in profiles.items():
+            out.append({
+                "auth_uid": uid,
+                "account_id": p.get("account_id"),
+                "brand": p.get("brand"),
+                "model": p.get("model"),
+                "android": p.get("android"),
+                "api": p.get("api"),
+                "memory": p.get("memory"),
+                "device_id": p.get("device_id"),
+                "garena_device_id": p.get("garena_device_id"),
+                "ua": devprof.ua_dalvik(p),
+                "variant": p.get("variant"),
+                "created": p.get("created"),
+                "rotated": p.get("rotated"),
+            })
+        return aiohttp.web.Response(text=json.dumps({
+            "ok": True, "phase": devprof.PHASE, "count": len(out),
+            "devices": out,
+        }, default=str, ensure_ascii=False),
+            content_type="application/json", charset="utf-8")
+    except Exception as e:
+        return aiohttp.web.json_response({"ok": False, "error": str(e)})
 
 async def start_web_server():
     app = aiohttp.web.Application(middlewares=[_req_logger])
@@ -3296,6 +3369,7 @@ async def start_web_server():
     app.router.add_get("/api/ping", api_ping)
     app.router.add_get("/api/stats", api_stats)
     app.router.add_get("/api/state", api_state)
+    app.router.add_get("/api/devices", api_devices)
     app.router.add_post("/api/create_team", api_create_team)
     app.router.add_post("/api/account/add", api_account_add)
     app.router.add_post("/api/account/delete", api_account_delete)
