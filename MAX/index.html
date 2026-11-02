@@ -603,6 +603,21 @@ body.c-down .c-ring{width:24px;height:24px;background:color-mix(in srgb,var(--em
   #particles{display:none}
   .c-dot,.c-ring{display:none}
 }
+/* ============ SMOOTH UI ============ */
+* { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+html { scroll-behavior: smooth; }
+body { overflow: hidden; }
+.log, .account-card, .btn, .seg button, .nav-item { transition: background var(--ease), color var(--ease), transform var(--ease), box-shadow var(--ease), border-color var(--ease); will-change: transform; }
+.console { scroll-behavior: smooth; }
+.page { animation: fadeIn .25s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+button, .btn { cursor: pointer; user-select: none; -webkit-tap-highlight-color: transparent; }
+button:active { transform: scale(.97); }
+.card, .surface { transition: box-shadow var(--ease), border-color var(--ease); }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(251,191,36,.25); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(251,191,36,.45); }
 </style>
 </head>
 <body>
@@ -751,6 +766,8 @@ body.c-down .c-ring{width:24px;height:24px;background:color-mix(in srgb,var(--em
         <div class="page-head">
           <div><h1 class="page-title" data-text="Live Console">Live Console</h1><p class="page-sub">Real-time server execution logs</p></div>
           <div class="row">
+            <button class="btn" id="btnCopyLogs"><i class="fa-regular fa-copy"></i>Copy Logs</button>
+            <button class="btn" id="btnDownloadLogs"><i class="fa-solid fa-download"></i>Download Logs</button>
             <button class="btn on" id="btnAutoscroll"><i class="fa-solid fa-arrow-down"></i>Auto-scroll</button>
             <button class="btn" id="btnClearLogs"><i class="fa-solid fa-trash"></i>Clear Logs</button>
           </div>
@@ -1530,6 +1547,31 @@ $("btnClearLogs").addEventListener("click", () => guard("clearLogs", async () =>
   try { const r = await fetch("/api/logs/clear", { method: "POST" }); if (!r.ok) throw 0; state.logs = []; renderLogs([]); toast("Console cleared", "success"); }
   catch (e) { state.logs = []; renderLogs([]); toast("(demo) Logs cleared", "info"); }
 }));
+$("btnCopyLogs").addEventListener("click", () => {
+  const list = (activeLogFilter === "match" ? state.logs.filter(l => String(l.message||"").toLowerCase().includes("match"))
+    : activeLogFilter === "success" ? state.logs.filter(l => l.level === "success" || String(l.message||"").includes("EXP"))
+    : activeLogFilter === "error" ? state.logs.filter(l => l.level === "error" || l.level === "warning")
+    : state.logs) || [];
+  const text = list.map(l => `[${l.time||"00:00:00"}] ${l.message||""}`).join("\\n");
+  const ok = () => toast("Logs copied (" + list.length + " lines)", "success");
+  const fb = () => { try { const ta = document.createElement("textarea"); ta.value = text; ta.style.cssText = "position:fixed;opacity:0"; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); toast("Logs copied (" + list.length + " lines)", "success"); } catch (e) { toast("Copy failed", "error"); } };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(ok, fb); else fb();
+});
+$("btnDownloadLogs").addEventListener("click", () => {
+  const list = (activeLogFilter === "match" ? state.logs.filter(l => String(l.message||"").toLowerCase().includes("match"))
+    : activeLogFilter === "success" ? state.logs.filter(l => l.level === "success" || String(l.message||"").includes("EXP"))
+    : activeLogFilter === "error" ? state.logs.filter(l => l.level === "error" || l.level === "warning")
+    : state.logs) || [];
+  const text = list.map(l => `[${l.time||"00:00:00"}] ${l.message||""}`).join("\\n");
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "glory-logs-" + new Date().toISOString().replace(/[:.]/g, "-") + ".txt";
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast("Downloaded " + list.length + " lines", "success");
+});
 $("btnAutoscroll").addEventListener("click", () => { autoScroll = !autoScroll; $("btnAutoscroll").classList.toggle("on", autoScroll); if (autoScroll) scrollLogsToEnd(); });
 $("console").addEventListener("scroll", () => {
   if (rendering) return;

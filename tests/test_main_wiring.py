@@ -109,7 +109,8 @@ def _extract(names, extra_globals):
     src_path = os.path.join(ROOT, "main.py")
     with open(src_path, encoding="utf-8") as f:
         tree = ast.parse(f.read())
-    fns = [n for n in tree.body if isinstance(n, ast.AsyncFunctionDef)
+    fns = [n for n in tree.body
+           if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
            and n.name in names]
     found = {f.name for f in fns}
     missing = set(names) - found
@@ -158,7 +159,8 @@ def test_payload_device_id():
     check("id stable across calls", again["19"] == dev["device_id"])
     check("crypto constant 57 untouched",
           a["57"] == "7428b253defc164018c604a1ebbfebdf")
-    check("field 25 still matches baseline", a["25"] == "samsung SM-E135F")
+    check("field 25 still matches baseline",
+          a["25"] == (dev["brand"] + " " + dev["model"]).lower(), a["25"])
     check("no-device fallback still random-format",
           fallback["19"].startswith("Google|")
           and fallback["19"] != dev["device_id"])
@@ -208,6 +210,119 @@ def test_access_token_ua():
     check("access token returns triplet", res == ("oid", "at", 4))
     check("oauth UA == profile UA",
           sink[0]["headers"]["User-Agent"] == dp.ua_dalvik(dev))
+
+
+def test_exp_field_parsing():
+    ns = _extract({"_unwrap_field", "_as_profile_int",
+                   "_profile_from_personal_show", "_profile_from_login_data"}, {})
+    ps = ns["_profile_from_personal_show"]
+    ld = ns["_profile_from_login_data"]
+    to_int = ns["_as_profile_int"]
+
+    check("personal-show layout",
+          ps({"1": {"data": {"3": "Nick", "6": 12, "7": 3456}}})
+          == ("Nick", 12, 3456))
+    check("login-data layout",
+          ld({"4": {"data": "Nick"}, "6": {"data": "12"},
+              "7": {"data": 3456}}) == ("Nick", 12, 3456))
+    check("nested personal-show layout",
+          ps({"1": {"data": {"1": {"data": {"3": "Nick", "6": 12, "7": 3456}}}}})
+          == ("Nick", 12, 3456))
+    check("string ints accepted", to_int("42") == 42)
+    check("bool rejected", to_int(True) is None)
+    check("junk rejected", to_int("abc") is None)
+    check("missing exp rejected",
+          ps({"1": {"data": {"3": "Nick", "6": 12}}})[2] is None)
+
+
+def test_join_clan_domain_fallbacks():
+    path = os.path.join(ROOT, "main.py")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    tree = ast.parse(src)
+    fn = next(n for n in tree.body
+              if isinstance(n, ast.AsyncFunctionDef) and n.name == "join_clan")
+    body = ast.get_source_segment(src, fn) or ""
+    check("join_clan tries account server_url", "base_url" in body)
+    check("join_clan tries region URL", "_get_region_url(region)" in body)
+    check("join_clan keeps alternate BP host",
+          "clientbp.ppmainecoonghj.com" in body)
+
+
+def test_register_account_is_monotonic():
+    with open(os.path.join(ROOT, "main.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    klass = next(n for n in tree.body
+                  if isinstance(n, ast.ClassDef) and n.name == "BotState")
+    from datetime import datetime as _dt
+    ns = {"time": __import__("time"), "datetime": _dt,
+          "Dict": dict, "List": list, "Any": object,
+          "asyncio": asyncio}
+    exec(compile(ast.Module(body=[klass], type_ignores=[]), "bs", "exec"), ns)
+    st = ns["BotState"]()
+    st.register_account("1", "A", level=5, exp=1000)
+    st.update_exp("1", 2500, 6)
+    st.register_account("1", "A", level=5, exp=1000)   # stale cache value
+    a = st.accounts["1"]
+    check("stale cache does not roll level back", a["level"] == 6, a["level"])
+    check("stale cache does not roll EXP back", a["current_exp"] == 2500,
+          a["current_exp"])
+    check("gained EXP preserved", a["gained_exp"] == 1500, a["gained_exp"])
+
+
+def test_soft_recover():
+    import time as _time
+
+    class _State:
+        def __init__(self):
+            self.accounts = {
+                "1": {"status": "IN_MATCH"},
+                "2": {"status": "ONLINE"},
+                "3": {"status": "IN_MATCH"},
+            }
+            self.account_workers = {"1": None, "2": None, "auth3": None}
+            self.auth_to_game_id = {"auth3": "3"}
+            self.game_to_auth_id = {"3": "auth3"}
+            self.healed = []
+
+        def request_heal(self, uid):
+            self.healed.append(str(uid))
+
+        def is_paused(self, uid):
+            return False
+
+    state = _State()
+    calls = {"restart": 0}
+
+    async def _sched():
+        calls["restart"] += 1
+
+    ns = _extract({"_soft_recover"}, {
+        "time": _time,
+        "asyncio": asyncio,
+        "bot_state": state,
+        "_heal_state": {"running": False, "times": []},
+        "_team_state": {"lock": asyncio.Lock(), "peers": {}, "leader_uid": None,
+                        "team_code": None},
+        "_team_stuck_state": {"lock": asyncio.Lock(), "in_team_since": {},
+                              "triggered": False},
+        "_no_match_state": {"lock": asyncio.Lock(), "global_last_match": None,
+                            "restart_triggered": False},
+        "_restart_state": {"lock": asyncio.Lock(), "finished_bots": set(),
+                           "target": None, "restarting": False},
+        "_schedule_restart": _sched,
+        "print_warning": lambda *a, **k: None,
+        "print_info": lambda *a, **k: None,
+        "print_error": lambda *a, **k: None,
+    })
+
+    asyncio.run(ns["_soft_recover"]("test"))
+    check("heal skips live match", state.healed == ["2"], state.healed)
+    state.healed.clear()
+    asyncio.run(ns["_soft_recover"]("test-stale", force_uids=["3"]))
+    check("forced heal frees stale IN_MATCH",
+          sorted(state.healed) == ["2", "3"], state.healed)
+    check("no execv restart on soft recovery", calls["restart"] == 0)
 
 
 def test_all_call_sites_pass_device():

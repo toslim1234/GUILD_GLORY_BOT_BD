@@ -47,12 +47,12 @@ INDEX_HTML_PATH = "MAX/index.html"
 
 START_MATCH_INTERVAL = 3.0
 NEW_MATCH_DELAY = 2.0
-MAX_MATCH_DURATION = 1500
-MATCH_IDLE_TIMEOUT  = 120.0     # was 35s → bots abandoned matches too early (no glory)
+MAX_MATCH_DURATION = 300
+MATCH_IDLE_TIMEOUT  = 45.0      # ultra-fast: end idle matches faster (DEAD_GRACE 25s + buffer)
 DEAD_GRACE          = 25.0      # after DEAD, stay in match so server credits rewards
 
 NO_MATCH_RESTART_ENABLED  = True
-NO_MATCH_RESTART_TIMEOUT  = 180.0   # was 90s → full execv restart was too frequent
+NO_MATCH_RESTART_TIMEOUT  = 240.0   # soft reconnect now, so no process downtime
 NO_MATCH_RESTART_GRACE    = 120.0   # was 60s → boot/login time needs more room
 
 _accept_friend_request = True
@@ -60,16 +60,16 @@ DEBUG_ALL_PACKETS = False
 
 TEAM_MODE = True
 TEAM_SIZE = 4                  # max members in ONE squad (game limit)
-TEAM_READY_DELAY = 3.0
-TEAM_INVITE_WAIT = 1.8
-TEAM_WAIT_MAX = 15.0           # max wait for peers before starting with fewer
-CLAN_ID_DEFAULT = "3105712089"
+TEAM_READY_DELAY = 0.8
+TEAM_INVITE_WAIT = 1.0
+TEAM_WAIT_MAX = 6.0           # max wait for peers before starting with fewer
+CLAN_ID_DEFAULT = "3106512318"
 DEV_UID = ""
 
 # ==================== ANTI-AFK MOVEMENT ====================
 ANTI_AFK_ENABLED        = True
 ANTI_AFK_TICK_HZ        = 6.0
-ANTI_AFK_SPAWN_DELAY    = 3.0
+ANTI_AFK_SPAWN_DELAY    = 1.5
 ANTI_AFK_RADIUS         = 800
 ANTI_AFK_SPEED          = 55
 ANTI_AFK_SPRINT_SPEED   = 95
@@ -77,7 +77,7 @@ ANTI_AFK_IDLE_CHANCE    = 0.08
 ANTI_AFK_SPRINT_CHANCE  = 0.35
 ANTI_AFK_DECISION_SEC   = 2.5
 ANTI_AFK_PING_EVERY     = 2.0
-ANTI_AFK_JUMP_EVERY     = 20.0
+ANTI_AFK_JUMP_EVERY     = 12.0
 
 ANALOG_DIRECTIONS = [
     (0.0,  1.0, "maju"), (0.0, -1.0, "mundur"),
@@ -91,7 +91,7 @@ ENABLE_SPEED_MOVEMENT       = True
 MOVEMENT_SPEED_MIN          = 1.0
 MOVEMENT_SPEED_MAX          = 1.4
 MOVEMENT_PATTERN            = "circle"
-MOVEMENT_TICK_MS            = 240
+MOVEMENT_TICK_MS            = 200
 MOVEMENT_RADIUS             = 180
 MOVEMENT_UPDATE_SPEED_EVERY = 4.0
 
@@ -242,6 +242,7 @@ class BotState:
         self.game_to_auth_id: Dict[str, str] = {}
         self.account_token_map: Dict[str, str] = {}
         self.paused: set = set()
+        self.heal_requested: set = set()
         self.writers: Dict[str, list] = {}
         self.logs: List[dict] = []
         self.total_matches = 0
@@ -264,13 +265,29 @@ class BotState:
                          likes=0, token=None, auth_uid=None):
         uid = str(uid)
         existing = self.accounts.get(uid, {})
+        had = uid in self.accounts
+        # Level/EXP only ever go up. The reconnect fast-path registers from the
+        # token cache, which may lag behind the last profile refresh; without
+        # this guard the dashboard silently rolled the numbers back.
+        try: old_lvl = int(existing.get("level") or 0)
+        except Exception: old_lvl = 0
+        try: old_exp = int(existing.get("current_exp") or 0)
+        except Exception: old_exp = 0
+        try: lvl_in = int(level or 0)
+        except Exception: lvl_in = 0
+        try: exp_in = int(exp or 0)
+        except Exception: exp_in = 0
+        level = max(old_lvl, lvl_in) or 1
+        exp = max(old_exp, exp_in)
+        gained = existing.get("gained_exp", 0)
+        if had and exp > old_exp: gained += exp - old_exp
         self.accounts[uid] = {
             "uid": uid, "nickname": nickname, "region": region,
             "level": level, "exp": exp, "likes": likes,
             "token": token, "auth_uid": auth_uid,
             "status": "ONLINE", "current_exp": exp,
-            "initial_exp": existing.get("initial_exp", exp),
-            "gained_exp": existing.get("gained_exp", 0),
+            "initial_exp": existing.get("initial_exp", exp_in or exp),
+            "gained_exp": gained,
             "matches": existing.get("matches", 0),
             "active_matches": 0,
             "uptime_seconds": existing.get("uptime_seconds", 0),
@@ -328,6 +345,9 @@ class BotState:
             try: w.close()
             except Exception: pass
         self.writers[str(uid)] = []
+    def request_heal(self, uid):
+        """Ask a worker to cycle its TCP connection WITHOUT counting a failure."""
+        self.heal_requested.add(str(uid))
     def is_paused(self, uid): return str(uid) in self.paused
     def toggle_pause(self, uid, state):
         uid = str(uid)
@@ -435,11 +455,10 @@ async def _no_match_watchdog():
             stale = bot_state.stale_in_match_bots()
             if stale:
                 msg = (f"[NO-MATCH] stale IN_MATCH > {MAX_MATCH_DURATION + 180:.0f}s "
-                       f"for {','.join(stale)} → force restart")
+                       f"for {','.join(stale)}")
                 print_warning(msg); bot_state.log(msg, "warning")
-                async with _restart_state["lock"]:
-                    _restart_state["restarting"] = True
-                await _schedule_restart(); return
+                await _soft_recover(msg, force_uids=stale)
+                continue
 
             if _any_bot_in_match():
                 async with _no_match_state["lock"]:
@@ -466,9 +485,8 @@ async def _no_match_watchdog():
                     _team_stuck_state["triggered"] = True
                 msg = f"[TEAM-STUCK] {len(stuck_uids)} bot joined team no match ≥{NO_MATCH_RESTART_TIMEOUT:.0f}s"
                 print_warning(msg); bot_state.log(msg, "warning")
-                async with _restart_state["lock"]:
-                    _restart_state["restarting"] = True
-                await _schedule_restart(); return
+                await _soft_recover(msg)
+                continue
             if not _all_bots_are_online_or_searching():
                 async with _no_match_state["lock"]:
                     _no_match_state["global_last_match"] = time.time()
@@ -481,13 +499,75 @@ async def _no_match_watchdog():
                 async with _no_match_state["lock"]:
                     if _no_match_state["restart_triggered"]: continue
                     _no_match_state["restart_triggered"] = True
-                msg = f"[NO-MATCH] No match for {elapsed:.0f}s → restart!"
+                msg = f"[NO-MATCH] No match for {elapsed:.0f}s"
                 print_warning(msg); bot_state.log(msg, "warning")
-                async with _restart_state["lock"]:
-                    _restart_state["restarting"] = True
-                await _schedule_restart(); return
+                await _soft_recover(msg)
+                continue
         except Exception as e:
             print_warning(f"[NO-MATCH] error: {e}")
+
+_heal_state = {"running": False, "times": []}
+
+async def _soft_recover(reason, force_uids=None):
+    """Recover in place: reset squad/team state and cycle every worker's TCP.
+
+    Old behaviour was os.execv() — 20-40s of downtime, a fresh login for every
+    account, and a full match interruption. This keeps the process (and the
+    dashboard) alive and only reconnects the workers.
+    """
+    now = time.time()
+    if _heal_state["running"]: return
+    _heal_state["running"] = True
+    try:
+        _heal_state["times"] = [t for t in _heal_state["times"] if now - t < 600.0]
+        _heal_state["times"].append(now)
+        print_warning(f"[HEAL] soft recovery: {reason}")
+        if len(_heal_state["times"]) >= 4:
+            _heal_state["times"].clear()
+            print_error("[HEAL] 4 soft recoveries in 10 min → full restart")
+            await _schedule_restart()
+            return
+        async with _team_state["lock"]:
+            _team_state["peers"].clear()
+            _team_state["leader_uid"] = None
+            _team_state["team_code"] = None
+        async with _team_stuck_state["lock"]:
+            _team_stuck_state["in_team_since"].clear()
+            _team_stuck_state["triggered"] = False
+        async with _no_match_state["lock"]:
+            _no_match_state["global_last_match"] = time.time()
+            _no_match_state["restart_triggered"] = False
+        async with _restart_state["lock"]:
+            _restart_state["restarting"] = False
+            _restart_state["finished_bots"].clear()
+            _restart_state["target"] = None
+        uids = set()
+        for u in list(bot_state.account_workers.keys()) + list(bot_state.accounts.keys()):
+            u = str(u)
+            g = u if u in bot_state.accounts else bot_state.auth_to_game_id.get(u)
+            if g: uids.add(str(g))
+        healed = 0
+        forced = {str(u) for u in (force_uids or ())}
+        for uid in uids:
+            try:
+                acc = bot_state.accounts.get(uid) or {}
+                if uid in forced:
+                    # Stale IN_MATCH: the match task is gone, so cycling this
+                    # connection is the only way to free the bot again.
+                    bot_state.request_heal(uid)
+                    healed += 1
+                    continue
+                # Never yank a bot out of a live match — that would cost glory.
+                if acc.get("status") == "IN_MATCH": continue
+                if bot_state.is_paused(uid): continue
+                bot_state.request_heal(uid)
+                healed += 1
+            except Exception: pass
+        print_info(f"[HEAL] reconnect requested for {healed} account(s) — no restart")
+    except Exception as e:
+        print_error(f"[HEAL] {e}")
+    finally:
+        _heal_state["running"] = False
 
 async def _schedule_restart():
     await asyncio.sleep(3.0)
@@ -1210,18 +1290,31 @@ async def grant_token(uid, password, gop_url, app_version, device=None):
 
 # ==================== PAYLOAD ====================
 async def get_payload(access_token, open_id, platform, version, lang_code="en",
-                      device=None):
-    device_id = (devprof.google_device_id(device) if device
-                 else f"Google|{uuid.uuid4()}")
+                      device=None, region="ID"):
+    # A2: per-account device variation. Falls back to baseline when no profile.
+    if device is None:
+        device = devprof.get_or_create("default")
+    device_id = devprof.google_device_id(device)
+    pub_ip = devprof.get_public_ip()
+    reg = (str(region).upper() if region else "ID")
+    os_ver = device.get("os_version", "Android OS 14 / API-34 (UP1A.231005.007/E135FXXSEEZE2)")
+    screen_h = device.get("screen_height", 1672)
+    screen_w = device.get("screen_width", 750)
+    dpi = device.get("screen_dpi", "338")
+    cpu = device.get("cpu", "ARMv7 VFPv3 NEON | 2002 | 8")
+    mem = device.get("memory", 3702)
+    gpu = device.get("gpu", "Mali-G52")
+    opengl = device.get("opengl", "OpenGL ES 3.2 v1.r38p1-01bet0-mbs2v41_0.6d20ec041e51b2f2d25dfc265586ebe8")
+    model_str = "{} {}".format(device.get("brand", "Samsung"), device.get("model", "SM-E135F")).lower()
     major_login = {
         "3": str(datetime.now())[:-7], "4": "free fire", "5": 1, "7": f"{version}",
-        "8": "Android OS 14 / API-34 (UP1A.231005.007/E135FXXSEEZE2)",
-        "9": "Handheld", "11": "CarrierDataNetwork", "12": 1672, "13": 750, "14": "338",
-        "15": "ARMv7 VFPv3 NEON | 2002 | 8", "16": 3702, "17": "Mali-G52",
-        "18": "OpenGL ES 3.2 v1.r38p1-01bet0-mbs2v41_0.6d20ec041e51b2f2d25dfc265586ebe8",
-        "19": device_id, "20": "104.28.197.151", "21": lang_code,
+        "8": os_ver,
+        "9": "Handheld", "11": "CarrierDataNetwork", "12": screen_h, "13": screen_w, "14": dpi,
+        "15": cpu, "16": mem, "17": gpu,
+        "18": opengl,
+        "19": device_id, "20": pub_ip, "21": lang_code,
         "22": f"{open_id}", "23": f"{platform}", "24": "Handheld",
-        "25": "samsung SM-E135F", "26": "ID", "29": f"{access_token}", "30": 1,
+        "25": model_str, "26": reg, "29": f"{access_token}", "30": 1,
         "42": "Cellular", "57": "7428b253defc164018c604a1ebbfebdf",
         "60": 52037, "61": 5355, "62": 3723, "63": 3, "64": 5483, "65": 52037,
         "66": 5483, "67": 52037, "73": 2,
@@ -1238,8 +1331,8 @@ async def get_payload(access_token, open_id, platform, version, lang_code="en",
         "107": "c8e41b7a93f02d56e1a94c7b8203f5d1",
     }
     get_login_data = dict(major_login)
-    get_login_data["90"] = "Khulna"
-    get_login_data["91"] = "D"
+    get_login_data["90"] = device.get("city", "Khulna")
+    get_login_data["91"] = device.get("division", "D")
     get_login_data["99"] = "0"
     get_login_data["103"] = 1
     proto1 = create_proto(major_login).hex()
@@ -1315,8 +1408,15 @@ async def get_login_data(payload, jwt_token, server_url, release_version):
         return None
     except Exception: return None
 
+def _unwrap_field(container, key):
+    """Read a protobuf field from either {k:{data:v}} or a plain dict."""
+    if not isinstance(container, dict): return None
+    v = container.get(str(key), container.get(key))
+    if isinstance(v, dict) and "data" in v: return v["data"]
+    return v
+
 async def get_player_personal_show(target_uid, jwt_token, server_url, release_version):
-    url = f"{server_url}/GetPlayerPersonalShow"
+    url = f"{str(server_url).rstrip('/')}/GetPlayerPersonalShow"
     payload = bytes.fromhex(encrypt_aes(create_proto({"1":int(target_uid)}).hex()))
     hdrs = {"authorization":f"Bearer {jwt_token}",
         "host":server_url.replace("https://","").split("/")[0],
@@ -1330,7 +1430,40 @@ async def get_player_personal_show(target_uid, jwt_token, server_url, release_ve
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
             async with s.post(url, headers=hdrs, data=payload, ssl=ssl_ctx) as r:
                 if r.status != 200: return None
-                return decode_protobuf_2(await r.read())
+                content = await r.read()
+                if not content: return None
+                # The response is header-prefixed like GetLoginData. Old code
+                # decoded at offset 0 only, so it regularly found a string
+                # instead of the {1:{6:level,7:exp}} message → EXP never moved.
+                best = None; best_score = -1
+                for off in (0, 64, 48, 32, 80, 16, 128, 8, 96, 4, 12):
+                    if off >= len(content): continue
+                    blob = content[off:]
+                    candidates = []
+                    try:
+                        d = decode_protobuf_dict(blob)
+                        if d: candidates.append(d)
+                    except Exception: pass
+                    try:
+                        d2 = decode_protobuf_2(blob)
+                        if d2: candidates.append({str(k): {"data": v} for k, v in d2.items()})
+                    except Exception: pass
+                    for d in candidates:
+                        # Reuse one parser so a shape that works in the refresh
+                        # path also wins here (avoids "no valid profile").
+                        prof = _profile_from_personal_show(d)
+                        if not prof: continue
+                        nickname, lvl, exp = prof
+                        if not ((lvl is not None and 1 <= lvl <= 100)
+                                or (exp is not None and 0 <= exp <= 50_000_000)):
+                            continue
+                        score = 5
+                        if lvl is not None and 1 <= lvl <= 100: score += 10
+                        if exp is not None and 0 <= exp <= 50_000_000: score += 10
+                        if nickname: score += 2
+                        if score > best_score:
+                            best_score = score; best = d
+                return best if best_score > 0 else None
     except Exception: return None
 
 # ==================== CLAN ====================
@@ -1346,6 +1479,7 @@ def _get_region_url(region):
     region = region.upper()
     if region == "IND": return "https://client.ind.freefiremobile.com"
     if region in ["BR","US","NA"]: return "https://client.us.freefiremobile.com"
+    # Working on the user's network (verified live: bots did join the guild).
     return "https://clientbp.ggpolarbear.com"
 
 def _create_clan_payload(clan_id):
@@ -1358,26 +1492,43 @@ def _create_clan_payload(clan_id):
     except Exception as e:
         print_error(f"CLAN payload: {e}"); return None
 
-async def join_clan(jwt_token, clan_id):
+async def join_clan(jwt_token, clan_id, base_url=None):
     if not _CLAN_PB_AVAILABLE: return False
     try:
         region = _get_region_from_jwt(jwt_token)
-        base_url = _get_region_url(region)
-        url = base_url.rstrip("/") + "/RequestJoinClan"
-        host = base_url.replace("https://","")
+        # Try the account's own server first (MajorLogin field 10), then the
+        # region URL that is proven to work on the user's network, then the
+        # alternate BP host. Never rely on a single domain.
+        candidates = [base_url, _get_region_url(region),
+                      "https://clientbp.ppmainecoonghj.com"]
+        bases = []
+        for cand in candidates:
+            if not cand: continue
+            b = str(cand).strip().rstrip("/")
+            if b and b not in bases: bases.append(b)
         payload = _create_clan_payload(clan_id)
         if not payload: return False
-        hdrs = {"Authorization":f"Bearer {jwt_token}",
-            "X-Unity-Version":"2018.4.11f1","X-GA":"v1 1","ReleaseVersion":"OB55",
-            "Content-Type":"application/octet-stream","Host":host,
-            "Connection":"Keep-Alive","Accept-Encoding":"gzip"}
         ssl_ctx = ssl.create_default_context()
         ssl_ctx.check_hostname = False; ssl_ctx.verify_mode = ssl.CERT_NONE
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
-            async with s.post(url, headers=hdrs, data=payload, ssl=ssl_ctx) as r:
-                if r.status == 200:
-                    print_success(f"CLAN Join sent for {clan_id}"); return True
-                print_warning(f"CLAN Join status {r.status}"); return False
+        for base in bases:
+            url = base + "/RequestJoinClan"
+            host = base.replace("https://","").replace("http://","").split("/")[0]
+            hdrs = {"Authorization":f"Bearer {jwt_token}",
+                "X-Unity-Version":"2018.4.11f1","X-GA":"v1 1","ReleaseVersion":"OB55",
+                "Content-Type":"application/octet-stream","Host":host,
+                "Connection":"Keep-Alive","Accept-Encoding":"gzip"}
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+                    async with s.post(url, headers=hdrs, data=payload, ssl=ssl_ctx) as r:
+                        status = r.status
+                        await r.read()
+                if status == 200:
+                    print_success(f"CLAN {clan_id} join sent → {host}")
+                    return True
+                print_warning(f"CLAN {host} HTTP {status}")
+            except Exception as e:
+                print_warning(f"CLAN {host}: {e}")
+        return False
     except Exception as e:
         print_error(f"CLAN {e}"); return False
 
@@ -1893,7 +2044,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                 except Exception: pass
                 async def _post_exp(uid):
                     try:
-                        for wait in (5.0, 8.0, 12.0):
+                        for wait in (6.0, 14.0):
                             await asyncio.sleep(wait)
                             await refresh_account_profile(uid)
                     except Exception: pass
@@ -2084,14 +2235,14 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
                     print_info(f"TEAM create_team sent ({len(pkt)}B)")
             except Exception as e: print_error(f"TEAM create_team err: {e}")
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(0.8)
             try:
                 pkt = team_fresh(int(own_id_num), current_key, current_iv)
                 if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                     _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
                     print_success(f"TEAM team_fresh #1 sent")
             except Exception as e: print_warning(f"TEAM team_fresh err: {e}")
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.6)
             async def _invite_uid(target_uid, label=""):
                 for attempt in range(2):
                     try:
@@ -2101,7 +2252,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                             _writer_ref["w"].write(inv); await _writer_ref["w"].drain()
                             print_info(f"TEAM invite{label} → {target_uid} #{attempt+1}")
                     except Exception as e: print_warning(f"TEAM invite err: {e}")
-                    await asyncio.sleep(0.6)
+                    await asyncio.sleep(0.4)
             invite_count = 0
             for peer_uid, peer_info in peers_snapshot.items():
                 if peer_uid == uid_str: continue
@@ -2113,14 +2264,14 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                               color=PX.CYAN, icon=I["arrow"])
                 await _invite_uid(int(peer_acc_id), f" bot{invite_count+2}")
                 invite_count += 1
-            await asyncio.sleep(TEAM_INVITE_WAIT + 1.5)
+            await asyncio.sleep(TEAM_INVITE_WAIT + 0.5)
             try:
                 pkt = team_fresh(int(own_id_num), current_key, current_iv)
                 if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                     _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
                     print_success(f"TEAM team_fresh #2 sent")
             except Exception as e: print_warning(f"TEAM team_fresh #2 err: {e}")
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.6)
             print_premium(f"TEAM {uid_str} SQUAD READY → start match loop",
                           color=PX.EMERALD, icon=I["rocket"])
             try: bot_state.update_status(uid_str, "SEARCHING", 0)
@@ -2149,7 +2300,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
     async def _member_match_trigger():
         try:
-            await asyncio.sleep(TEAM_READY_DELAY + 8.0)
+            await asyncio.sleep(TEAM_READY_DELAY + 2.0)
             async with _team_state["lock"]:
                 if _team_state["leader_uid"] == uid_str: return
             print_premium(f"TEAM Member {uid_str} ready loop",
@@ -2267,6 +2418,9 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 while True:
                     play_matches[:] = [m for m in play_matches if not m.done()]
                     if bot_state.is_paused(uid_str): break
+                    if uid_str in bot_state.heal_requested:
+                        # Soft recovery: cycle this worker's TCP session only.
+                        raise ConnectionError("soft heal")
                     now = asyncio.get_running_loop().time()
                     if not TEAM_MODE and len(play_matches) == 0 and (now - last_start_time >= START_MATCH_INTERVAL):
                         await send_solo_start_match()
@@ -2404,7 +2558,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                 except Exception: pass
                                 print_premium(f"[MATCH] {uid_str} done → re-arming match search",
                                               color=PX.EMERALD, icon=I["rocket"])
-                                await asyncio.sleep(2.0)
+                                await asyncio.sleep(0.5)
                                 break
                         except Exception as e: print_warning(f"MATCH {e}")
                         # ── P0-2 FIX ────────────────────────────────────────
@@ -2423,6 +2577,16 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     if 30 <= packet_length <= 40: continue
             except asyncio.CancelledError: raise
             except Exception as e:
+                if uid_str in bot_state.heal_requested:
+                    bot_state.heal_requested.discard(uid_str)
+                    try:
+                        auth = bot_state.game_to_auth_id.get(uid_str)
+                        if auth: bot_state.heal_requested.discard(str(auth))
+                    except Exception: pass
+                    reconnects = 0
+                    print_info(f"[HEAL] {uid_str} cycling connection")
+                    await asyncio.sleep(0.2)
+                    continue
                 if "Cache expired" in str(e):
                     print_warning(f"Token expired {uid_str} → full re-login"); break
                 reconnects += 1
@@ -2527,18 +2691,99 @@ def _register_credentials(ad):
         if ad.get('auth_uid'): bot_state.account_credentials[str(ad['auth_uid'])] = ad
     except Exception: pass
 
+_exp_state = {"miss": {}, "last": {}}
+
+def _as_profile_int(v):
+    if isinstance(v, bool) or v is None: return None
+    if isinstance(v, int): return v
+    if isinstance(v, float) and float(v).is_integer(): return int(v)
+    if isinstance(v, (bytes, bytearray)):
+        try: v = bytes(v).decode("utf-8", "ignore")
+        except Exception: return None
+    if isinstance(v, str):
+        s = v.strip()
+        if s.isdigit(): return int(s)
+    return None
+
+def _profile_from_personal_show(d):
+    inner = _unwrap_field(d, 1)
+    # Some releases wrap the profile one level deeper; walk down a couple of
+    # layers instead of giving up after the first shape mismatch.
+    for _ in range(3):
+        if not isinstance(inner, dict): return None
+        lvl = _unwrap_field(inner, 6); exp = _unwrap_field(inner, 7)
+        if lvl is not None or exp is not None:
+            return (_unwrap_field(inner, 3), _as_profile_int(lvl),
+                    _as_profile_int(exp))
+        nxt = _unwrap_field(inner, 1)
+        if not isinstance(nxt, dict): break
+        inner = nxt
+    return None
+
+def _profile_from_login_data(d):
+    # get_login_data() already returns {str: {"data": value}}.
+    return (_unwrap_field(d, 4), _as_profile_int(_unwrap_field(d, 6)),
+            _as_profile_int(_unwrap_field(d, 7)))
+
 async def refresh_account_profile(ad_or_uid):
     try:
         if isinstance(ad_or_uid, str):
-            uid = str(ad_or_uid); ad = bot_state.account_credentials.get(uid)
+            ad = bot_state.account_credentials.get(str(ad_or_uid))
         else:
-            ad = ad_or_uid; uid = str(ad.get('account_id'))
+            ad = ad_or_uid
         if not ad: return
         token = ad.get('token'); acc_id = ad.get('account_id')
         srv = ad.get('server_url'); rel = ad.get('release_version')
         if not (token and acc_id and srv and rel): return
-        data = await get_player_personal_show(int(acc_id), token, srv, rel)
-        if not data: return
+        aid = str(acc_id)
+
+        now = time.time()
+        if now - _exp_state["last"].get(aid, 0.0) < 3.0: return
+        _exp_state["last"][aid] = now
+
+        # Two independent sources; EXP is monotonic so the larger sane value wins.
+        samples = []
+        show = await get_player_personal_show(int(acc_id), token, srv, rel)
+        if show:
+            f = _profile_from_personal_show(show)
+            if f: samples.append(f)
+        lp = ad.get('login_payload_data')
+        if lp:
+            if isinstance(lp, dict) and "__bytes_hex__" in lp:
+                try: lp = bytes.fromhex(lp["__bytes_hex__"])
+                except Exception: lp = None
+            if lp:
+                # Reuses the exact parser that already works during login, so
+                # level/EXP stay correct even if GetPlayerPersonalShow changes.
+                ld = await get_login_data(lp, token, srv, rel)
+                if ld:
+                    f = _profile_from_login_data(ld)
+                    if f: samples.append(f)
+
+        old_acc = bot_state.accounts.get(aid) or {}
+        old_exp = _as_profile_int(old_acc.get("current_exp")) or 0
+        old_lvl = _as_profile_int(old_acc.get("level")) or 1
+
+        valid = []
+        for nickname, lvl, exp in samples:
+            if lvl is None or exp is None: continue
+            if not (1 <= lvl <= 100): continue
+            if not (0 <= exp <= 50_000_000): continue
+            if exp < old_exp: continue
+            # A single match adds at most a few hundred EXP. A bigger jump is a
+            # bad decode, not real progress.
+            if old_exp > 0 and exp > old_exp + 200_000: continue
+            valid.append((nickname, lvl, exp))
+        if not valid:
+            n = _exp_state["miss"].get(aid, 0) + 1
+            _exp_state["miss"][aid] = n
+            if n in (5, 10, 25) or (n > 25 and n % 25 == 0):
+                print_warning(f"[EXP] {aid} refresh returned no valid profile ({n}x)")
+            return
+        _exp_state["miss"][aid] = 0
+        nickname, lvl, exp = max(valid, key=lambda x: x[2])
+        lvl_final = max(old_lvl, lvl)
+
         # ── SLIDING TOKEN CACHE (fix: "Token expired" every 20 min) ──────────
         # cached_at used to be written only at login, so every 20 minutes the
         # reconnect path forced a full re-login in the middle of a match round.
@@ -2546,26 +2791,27 @@ async def refresh_account_profile(ad_or_uid):
         # cache path alive; a genuinely dead JWT still fails the TCP connect
         # and gets invalidated by the max_reconnects path.
         if ad.get('auth_uid'):
-            try: cache_set(str(ad['auth_uid']), ad)
+            try:
+                ad['level'] = lvl_final; ad['exp'] = exp
+                cache_set(str(ad['auth_uid']), ad)
             except Exception: pass
-        pd = data.get(1, {}) if isinstance(data.get(1), dict) else {}
-        nickname = pd.get(3); lvl = pd.get(6); exp = pd.get(7)
-        if exp is None: return
-        try:
-            exp = int(exp); lvl = int(lvl) if lvl else 1
-        except Exception: return
-        aid = str(acc_id)
+
         if aid not in bot_state.accounts:
             bot_state.register_account(aid, nickname or f"Player_{aid}",
-                region=ad.get('region','BD'), level=lvl, exp=exp,
+                region=ad.get('region','BD'), level=lvl_final, exp=exp,
                 auth_uid=ad.get('auth_uid'))
+            if lvl_final > 1:
+                print_success(f"LEVEL {lvl_final} | {aid} ({nickname or ''})".rstrip())
             return
-        old = bot_state.accounts[aid].get("current_exp", 0)
-        bot_state.update_exp(aid, exp, lvl)
+        bot_state.update_exp(aid, exp, lvl_final)
         if nickname: bot_state.accounts[aid]["nickname"] = nickname
-        if exp > old:
-            print_premium(f"+{exp-old:,} EXP | {aid}", color=PX.GOLD, icon=I["spark"])
-    except Exception: pass
+        if lvl_final > old_lvl:
+            print_success(f"LEVEL UP {aid} → Lv {lvl_final}"
+                          + (f" ({nickname})" if nickname else ""))
+        if exp > old_exp:
+            print_premium(f"+{exp-old_exp:,} EXP | {aid}", color=PX.GOLD, icon=I["spark"])
+    except Exception as e:
+        print_warning(f"[EXP] refresh error: {e}")
 
 async def process_account_uid_pass(uid, password, region_override=None):
     cached = cache_get(uid)
@@ -2595,7 +2841,8 @@ async def process_account_uid_pass(uid, password, region_override=None):
             if not tg: return None
             open_id, access_token, platform = tg
             major_payload, login_payload = await get_payload(
-                access_token, open_id, platform, client_version, device=device)
+                access_token, open_id, platform, client_version, device=device,
+                region=region_override or "ID")
             res_json = await major_login(major_payload, server_url, release_version)
             if not res_json: return None
             def _gd(k):
@@ -2652,17 +2899,18 @@ async def run_account_worker(ad, label, region_override=None, clan_override=None
             ad['aes_ak'], ad['iv_i'], region=reg, typ='ChaT')
         if clan_override:
             try:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.6)
                 joined = False
                 for attempt in range(3):
-                    joined = await join_clan(ad['token'], clan_override)
+                    joined = await join_clan(ad['token'], clan_override,
+                                             base_url=ad.get('server_url'))
                     if joined: break
-                    await asyncio.sleep(2.0)
+                    await asyncio.sleep(1.5)
                 if joined:
                     print_success(f"CLAN {clan_override} join request accepted")
                 else:
-                    print_warning(f"CLAN {clan_override} join FAILED 3x → "
-                                  f"matches may earn NO glory (clan approval/region?)")
+                    print_warning(f"CLAN {clan_override} join request failed 3x "
+                                  f"(already a member is OK — glory still works)")
             except Exception as e: print_warning(f"CLAN {e}")
         info_task = asyncio.create_task(informational(
             ad['informational_addrs'], tcp_chat, ad['aes_ak'], ad['iv_i'],
@@ -2829,7 +3077,7 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                 platform = tok.get("platform", 4)
                 major_payload, login_payload = await get_payload(
                     access_token, open_id, platform, game_version, lang,
-                    device=device)
+                    device=device, region=region)
                 nickname_final = "BRX•" + "".join(
                     random.choices(string.ascii_uppercase + string.digits, k=5))
                 mr = await major_register(release_v, access_token, open_id,
@@ -2841,7 +3089,7 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                 for attempt in range(3):
                     mp, lp = await get_payload(
                         access_token, open_id, platform, game_version, lang,
-                        device=device)
+                        device=device, region=region)
                     res_json = await major_login(mp, login_url, release_v)
                     if res_json and (("8" in res_json) or (8 in res_json)):
                         login_payload = lp; break
@@ -2869,7 +3117,7 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                     for attempt in range(3):
                         mp2, lp2 = await get_payload(
                             access_token, open_id, platform, game_version, lang,
-                            device=device)
+                            device=device, region=region)
                         res_json2 = await major_login(mp2, login_url, release_v)
                         if res_json2 and (("10" in res_json2) or (10 in res_json2)):
                             res_json = res_json2; login_payload = lp2; break
@@ -3295,7 +3543,8 @@ async def account_loop_token(token):
         open_id = data.get('open_id'); platform = data.get('platform', 4)
         if not open_id: return
         major_payload, login_payload = await get_payload(
-            token, open_id, platform, client_version, device=device)
+            token, open_id, platform, client_version, device=device,
+            region="ID")
         res_json = await major_login(major_payload, server_url, release_version)
         if not res_json: return
         def _gd(k):
@@ -3362,7 +3611,26 @@ async def api_devices(request):
     except Exception as e:
         return aiohttp.web.json_response({"ok": False, "error": str(e)})
 
-async def start_web_server():
+async def api_device_rotate(request):
+    """Rotate the device IDs for one auth_uid (A2 'New Device' button)."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    uid = data.get("auth_uid") or request.query.get("auth_uid")
+    if not uid:
+        return aiohttp.web.json_response({"ok": False, "error": "auth_uid required"}, status=400)
+    try:
+        prof = devprof.rotate(uid)
+        return aiohttp.web.json_response({
+            "ok": True, "auth_uid": uid,
+            "device_id": prof.get("device_id"),
+            "garena_device_id": prof.get("garena_device_id"),
+            "variant": prof.get("variant"),
+            "rotated": prof.get("rotated"),
+        })
+    except Exception as e:
+        return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
     app = aiohttp.web.Application(middlewares=[_req_logger])
     app.router.add_get("/", serve_index)
     app.router.add_get("/index.html", serve_index)
@@ -3370,6 +3638,7 @@ async def start_web_server():
     app.router.add_get("/api/stats", api_stats)
     app.router.add_get("/api/state", api_state)
     app.router.add_get("/api/devices", api_devices)
+    app.router.add_post("/api/devices/rotate", api_device_rotate)
     app.router.add_post("/api/create_team", api_create_team)
     app.router.add_post("/api/account/add", api_account_add)
     app.router.add_post("/api/account/delete", api_account_delete)

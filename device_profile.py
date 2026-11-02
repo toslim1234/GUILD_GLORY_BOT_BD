@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import uuid
+import urllib.request
 
 # Location is anchored to this file, not the process CWD, so the bot's working
 # directory can never split one account across two device files.
@@ -32,11 +33,11 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 DEVICES_FILE = os.environ.get("FF_DEVICES_FILE") or os.path.join(
     _HERE, "devices.json")
 
-PROFILE_VERSION = 1
-PHASE = "A1"
+PROFILE_VERSION = 2
+PHASE = "A2"
 
-# A2 will flip this on and use DEVICE_POOL below.  A1 always takes BASELINE.
-VARIATION_ENABLED = False
+# A2: per-account device variation is ON.
+VARIATION_ENABLED = True
 
 BASELINE = {
     "brand": "Samsung",
@@ -63,21 +64,60 @@ BASELINE = {
 
 # Reserved for Phase A2 — not reachable while VARIATION_ENABLED is False.
 DEVICE_POOL = [
-    {"brand": "Samsung", "model": "SM-A125F", "gpu": "Mali-G57",
+    # Samsung
+    {"brand": "Samsung", "model": "SM-A125F", "gpu": "Mali-G57", "gpu_vendor": "ARM",
      "android": "13", "api": 33, "memory": 3072, "screen_width": 720,
-     "screen_height": 1600, "screen_dpi": "320"},
-    {"brand": "Xiaomi", "model": "2201122G", "gpu": "Adreno (TM) 730",
+     "screen_height": 1600, "screen_dpi": "320", "cpu": "ARMv7 VFPv3 NEON | 1800 | 8",
+     "opengl": "OpenGL ES 3.2 v1.r32p1-01bet0-mbs2v41_0.6d20ec041e51b2f2d25dfc265586ebe8",
+     "os_version": "Android OS 13 / API-33 (TP1A.220624.014/A125FXXS7CWL1)",
+     "build": "TP1A.220624.014/A125FXXS7CWL1", "city": "Dhaka", "division": "D",
+     "network": "CarrierDataNetwork", "locale": "en", "country": "GB"},
+    # Xiaomi
+    {"brand": "Xiaomi", "model": "2201122G", "gpu": "Adreno (TM) 730", "gpu_vendor": "Qualcomm",
      "android": "13", "api": 33, "memory": 6144, "screen_width": 1080,
-     "screen_height": 2400, "screen_dpi": "395"},
-    {"brand": "realme", "model": "RMX3700", "gpu": "Mali-G710",
+     "screen_height": 2400, "screen_dpi": "395", "cpu": "Kryo (TM) 780 | 2400 | 8",
+     "opengl": "OpenGL ES 3.2 v1.0", "os_version": "Android OS 13 / API-33 (TKQ1.221114.001/V14.0.4.0.TLCMIXM)",
+     "build": "TKQ1.221114.001/V14.0.4.0.TLCMIXM", "city": "Khulna", "division": "D",
+     "network": "CarrierDataNetwork", "locale": "en", "country": "GB"},
+    # realme
+    {"brand": "realme", "model": "RMX3700", "gpu": "Mali-G710", "gpu_vendor": "ARM",
      "android": "14", "api": 34, "memory": 6144, "screen_width": 1080,
-     "screen_height": 2412, "screen_dpi": "400"},
-    {"brand": "OnePlus", "model": "CPH2451", "gpu": "Adreno (TM) 740",
+     "screen_height": 2412, "screen_dpi": "400", "cpu": "ARMv8 | 2400 | 8",
+     "opengl": "OpenGL ES 3.2 v1.r40p0", "os_version": "Android OS 14 / API-34 (UP1A.231005.007/RMX3700_14.0.0.100)",
+     "build": "UP1A.231005.007/RMX3700_14.0.0.100", "city": "Chittagong", "division": "C",
+     "network": "CarrierDataNetwork", "locale": "en", "country": "GB"},
+    # OnePlus
+    {"brand": "OnePlus", "model": "CPH2451", "gpu": "Adreno (TM) 740", "gpu_vendor": "Qualcomm",
      "android": "13", "api": 33, "memory": 8192, "screen_width": 1080,
-     "screen_height": 2412, "screen_dpi": "394"},
+     "screen_height": 2412, "screen_dpi": "394", "cpu": "Kryo (TM) 888 | 2800 | 8",
+     "opengl": "OpenGL ES 3.2 v1.0", "os_version": "Android OS 13 / API-33 (SKQ1.221119.001/CPH2451_13.1.0.500)",
+     "build": "SKQ1.221119.001/CPH2451_13.1.0.500", "city": "Sylhet", "division": "S",
+     "network": "CarrierDataNetwork", "locale": "en", "country": "GB"},
+    # OPPO
+    {"brand": "OPPO", "model": "CPH2551", "gpu": "Mali-G615", "gpu_vendor": "ARM",
+     "android": "14", "api": 34, "memory": 8192, "screen_width": 1080,
+     "screen_height": 2412, "screen_dpi": "394", "cpu": "ARMv8 | 2600 | 8",
+     "opengl": "OpenGL ES 3.2 v1.r44p0", "os_version": "Android OS 14 / API-34 (UP1A.231005.007/CPH2551_14.0.0.300)",
+     "build": "UP1A.231005.007/CPH2551_14.0.0.300", "city": "Rajshahi", "division": "R",
+     "network": "CarrierDataNetwork", "locale": "en", "country": "GB"},
+    # vivo
+    {"brand": "vivo", "model": "V2230", "gpu": "Mali-G610", "gpu_vendor": "ARM",
+     "android": "13", "api": 33, "memory": 4096, "screen_width": 1080,
+     "screen_height": 2408, "screen_dpi": "390", "cpu": "ARMv8 | 2200 | 8",
+     "opengl": "OpenGL ES 3.2 v1.r36p0", "os_version": "Android OS 13 / API-33 (TP1A.220624.014/V2230_13.0.0.100)",
+     "build": "TP1A.220624.014/V2230_13.0.0.100", "city": "Barishal", "division": "B",
+     "network": "CarrierDataNetwork", "locale": "en", "country": "GB"},
+    # Infinix
+    {"brand": "Infinix", "model": "X6833B", "gpu": "Mali-G57", "gpu_vendor": "ARM",
+     "android": "13", "api": 33, "memory": 4096, "screen_width": 720,
+     "screen_height": 1612, "screen_dpi": "270", "cpu": "ARMv8 | 2000 | 8",
+     "opengl": "OpenGL ES 3.2 v1.r32p1", "os_version": "Android OS 13 / API-33 (TP1A.220624.014/X6833B-H694EFGHI)",
+     "build": "TP1A.220624.014/X6833B-H694EFGHI", "city": "Rangpur", "division": "R",
+     "network": "CarrierDataNetwork", "locale": "en", "country": "GB"},
 ]
 
 _LOCK = threading.RLock()
+_PUBLIC_IP_CACHE = None
 
 
 # ───────────────────────────── helpers ─────────────────────────────
@@ -277,6 +317,31 @@ def remove(auth_uid):
 def all_profiles():
     with _LOCK:
         return copy.deepcopy(_load_locked())
+
+
+def get_public_ip():
+    """Best-effort real public IP for payload field 20. Cached for 1 hour.
+
+    Falls back to a stable default if the network is unreachable, so a failed
+    lookup never blocks login.
+    """
+    global _PUBLIC_IP_CACHE
+    now = time.time()
+    if _PUBLIC_IP_CACHE and (now - _PUBLIC_IP_CACHE[1]) < 3600:
+        return _PUBLIC_IP_CACHE[0]
+    ip = None
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                v = r.read().decode("ascii", "ignore").strip()
+                if v and all(c.isdigit() or c == "." for c in v):
+                    ip = v; break
+        except Exception:
+            continue
+    if not ip:
+        ip = "104.28.197.151"
+    _PUBLIC_IP_CACHE = (ip, now)
+    return ip
 
 
 # ─────────────────────────── formatters ────────────────────────────

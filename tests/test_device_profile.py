@@ -58,7 +58,8 @@ def test_new_profile():
     check("uuid length", len(p["device_id"]) == len("Google|") + 36)
     check("google_account_id 16 hex", len(p["google_account_id"]) == 16
           and all(c in "0123456789abcdef" for c in p["google_account_id"]))
-    check("baseline model", p["model"] == "SM-E135F")
+    check("baseline model", p["model"] in ({dp.BASELINE["model"]} |
+          {d["model"] for d in dp.DEVICE_POOL}), p["model"])
     check("has no file yet", not os.path.exists(dp.DEVICES_FILE))
 
 
@@ -139,7 +140,7 @@ def test_partial_profile_heals():
 
 def test_user_agents():
     fresh_dir()
-    p = dp.get_or_create("888")
+    p = dict(dp.BASELINE)
     check("dalvik UA",
           dp.ua_dalvik(p) == "Dalvik/2.1.0 (Linux; U; Android 14; SM-E135F)",
           dp.ua_dalvik(p))
