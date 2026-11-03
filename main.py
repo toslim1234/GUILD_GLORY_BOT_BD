@@ -1291,7 +1291,6 @@ async def grant_token(uid, password, gop_url, app_version, device=None):
 # ==================== PAYLOAD ====================
 async def get_payload(access_token, open_id, platform, version, lang_code="en",
                       device=None, region="ID"):
-    # A2: per-account device variation. Falls back to baseline when no profile.
     if device is None:
         device = devprof.get_or_create("default")
     device_id = devprof.google_device_id(device)
