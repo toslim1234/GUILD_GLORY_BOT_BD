@@ -52,8 +52,51 @@ MATCH_IDLE_TIMEOUT  = 45.0      # ultra-fast: end idle matches faster (DEAD_GRAC
 DEAD_GRACE          = 25.0      # after DEAD, stay in match so server credits rewards
 
 NO_MATCH_RESTART_ENABLED  = True
-NO_MATCH_RESTART_TIMEOUT  = 240.0   # soft reconnect now, so no process downtime
+NO_MATCH_RESTART_TIMEOUT  = 100.0   # was 240s — heal finds match in 24-38s, waiting
 NO_MATCH_RESTART_GRACE    = 120.0   # was 60s → boot/login time needs more room
+
+# ── Ultra Fast Glory: runtime match-speed control ──────────────────────
+# Dashboard switch changes MAX_MATCH_DURATION live (no code edit, no restart).
+# Each preset also retunes MATCH_IDLE_TIMEOUT so idle matches end proportionally.
+MATCH_SPEED_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "match_speed.json")
+MATCH_SPEED_PRESETS = {
+    "normal": {"duration": 300, "idle": 45.0},
+    "fast":   {"duration": 180, "idle": 35.0},
+    "ultra":  {"duration": 120, "idle": 30.0},
+    "turbo":  {"duration": 90,  "idle": 25.0},
+}
+MATCH_SPEED_MODE   = "normal"
+
+def apply_match_speed(mode, save=True):
+    """Switch MAX_MATCH_DURATION + MATCH_IDLE_TIMEOUT for the live process."""
+    global MATCH_SPEED_MODE
+    p = MATCH_SPEED_PRESETS.get(str(mode).lower())
+    if not p:
+        raise ValueError(f"unknown match speed mode: {mode}")
+    globals()["MAX_MATCH_DURATION"] = p["duration"]
+    globals()["MATCH_IDLE_TIMEOUT"] = float(p["idle"])
+    MATCH_SPEED_MODE = str(mode).lower()
+    if save:
+        try:
+            with open(MATCH_SPEED_FILE, "w", encoding="utf-8") as f:
+                json.dump({"mode": MATCH_SPEED_MODE}, f)
+        except Exception as e:
+            print_warning(f"[MATCH-SPEED] save failed: {e}")
+    print_premium(f"MATCH SPEED → {MATCH_SPEED_MODE.upper()} "
+                  f"(duration={p['duration']}s idle={p['idle']:.0f}s)",
+                  color=PX.GOLD, icon=I["rocket"])
+    return MATCH_SPEED_MODE
+
+def load_match_speed():
+    """Restore the last dashboard-selected speed (survives restarts)."""
+    try:
+        with open(MATCH_SPEED_FILE, encoding="utf-8") as f:
+            mode = json.load(f).get("mode")
+        if mode in MATCH_SPEED_PRESETS:
+            apply_match_speed(mode, save=False)
+    except Exception:
+        pass  # file missing → keep defaults
 
 _accept_friend_request = True
 DEBUG_ALL_PACKETS = False
@@ -1259,6 +1302,10 @@ async def register_account(password, gop_url, app_version, device=None):
                               timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 data = json.loads(await resp.text())
                 if data.get("code") == 0: return data["data"]["uid"]
+                # Diagnostics: show the real Gop error so register retries
+                # don't look like a silent failure.
+                print_warning(f"[REGISTER] code={data.get('code')} "
+                              f"error={data.get('error') or data.get('message') or data}")
     except Exception as e: print_error(f"[REGISTER] {e}")
     return None
 
@@ -1293,27 +1340,19 @@ async def get_payload(access_token, open_id, platform, version, lang_code="en",
                       device=None, region="ID"):
     if device is None:
         device = devprof.get_or_create("default")
+    # A2 rollback (step2): server validated device fields — only field 19
+    # (device_id) varies per account now; everything else is the proven
+    # baseline payload that worked before A2.
     device_id = devprof.google_device_id(device)
-    pub_ip = devprof.get_public_ip()
-    reg = (str(region).upper() if region else "ID")
-    os_ver = device.get("os_version", "Android OS 14 / API-34 (UP1A.231005.007/E135FXXSEEZE2)")
-    screen_h = device.get("screen_height", 1672)
-    screen_w = device.get("screen_width", 750)
-    dpi = device.get("screen_dpi", "338")
-    cpu = device.get("cpu", "ARMv7 VFPv3 NEON | 2002 | 8")
-    mem = device.get("memory", 3702)
-    gpu = device.get("gpu", "Mali-G52")
-    opengl = device.get("opengl", "OpenGL ES 3.2 v1.r38p1-01bet0-mbs2v41_0.6d20ec041e51b2f2d25dfc265586ebe8")
-    model_str = "{} {}".format(device.get("brand", "Samsung"), device.get("model", "SM-E135F")).lower()
     major_login = {
         "3": str(datetime.now())[:-7], "4": "free fire", "5": 1, "7": f"{version}",
-        "8": os_ver,
-        "9": "Handheld", "11": "CarrierDataNetwork", "12": screen_h, "13": screen_w, "14": dpi,
-        "15": cpu, "16": mem, "17": gpu,
-        "18": opengl,
-        "19": device_id, "20": pub_ip, "21": lang_code,
+        "8": "Android OS 14 / API-34 (UP1A.231005.007/E135FXXSEEZE2)",
+        "9": "Handheld", "11": "CarrierDataNetwork", "12": 1672, "13": 750, "14": "338",
+        "15": "ARMv7 VFPv3 NEON | 2002 | 8", "16": 3702, "17": "Mali-G52",
+        "18": "OpenGL ES 3.2 v1.r38p1-01bet0-mbs2v41_0.6d20ec041e51b2f2d25dfc265586ebe8",
+        "19": device_id, "20": "104.28.197.151", "21": lang_code,
         "22": f"{open_id}", "23": f"{platform}", "24": "Handheld",
-        "25": model_str, "26": reg, "29": f"{access_token}", "30": 1,
+        "25": "samsung SM-E135F", "26": "ID", "29": f"{access_token}", "30": 1,
         "42": "Cellular", "57": "7428b253defc164018c604a1ebbfebdf",
         "60": 52037, "61": 5355, "62": 3723, "63": 3, "64": 5483, "65": 52037,
         "66": 5483, "67": 52037, "73": 2,
@@ -1330,8 +1369,8 @@ async def get_payload(access_token, open_id, platform, version, lang_code="en",
         "107": "c8e41b7a93f02d56e1a94c7b8203f5d1",
     }
     get_login_data = dict(major_login)
-    get_login_data["90"] = device.get("city", "Khulna")
-    get_login_data["91"] = device.get("division", "D")
+    get_login_data["90"] = "Khulna"
+    get_login_data["91"] = "D"
     get_login_data["99"] = "0"
     get_login_data["103"] = 1
     proto1 = create_proto(major_login).hex()
@@ -2275,6 +2314,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                           color=PX.EMERALD, icon=I["rocket"])
             try: bot_state.update_status(uid_str, "SEARCHING", 0)
             except Exception: pass
+            heartbeats = 0
             while _team_active["flag"] and not _match_played["flag"]:
                 try:
                     if bot_state.is_paused(uid_str): break
@@ -2291,6 +2331,12 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                         _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
                 except Exception as e: print_warning(f"TEAM start_match err: {e}")
+                # Heartbeat: akta search jodi west na hoy, setup patent hole
+                # diag_data always visible thakbe.
+                heartbeats = heartbeats + 1
+                if heartbeats % 5 == 0:
+                    print_info(f"SEARCH {uid_str}: {heartbeats*5}s no match — "
+                               f"start_match still sending every ~5s")
                 try: await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
                 except asyncio.TimeoutError: pass
         except asyncio.CancelledError: raise
@@ -3060,8 +3106,17 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
             _prog(f"Creating bot {i+1}/{count}...")
             try:
                 device = devprof.new_profile()
-                uid = await register_account(password, gop_1, app_version,
-                                             device=device)
+                # Round 1 retry: consecutive guest:register calls can get
+                # rate-limited; back off twice before giving up on a slot.
+                uid = None
+                for attempt, delay in enumerate((0, 3.0, 5.0, 8.0), start=1):
+                    if delay:
+                        await asyncio.sleep(delay)
+                    uid = await register_account(password, gop_1, app_version,
+                                                 device=device)
+                    if uid:
+                        break
+                    _prog(f"bot {i+1}: register attempt {attempt}/4 failed")
                 if not uid:
                     _prog(f"bot {i+1}: register failed"); continue
                 try:
@@ -3315,7 +3370,11 @@ async def serve_index(request):
     for path in (INDEX_HTML_PATH, "index.html"):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return aiohttp.web.Response(text=f.read(), content_type="text/html")
+                # no-store: dashboard HTML edit korle browser cache kokhono
+                # purano version dekhabe na.
+                return aiohttp.web.Response(
+                    text=f.read(), content_type="text/html",
+                    headers={"Cache-Control": "no-store, must-revalidate"})
         except Exception: continue
     return aiohttp.web.Response(text="<h1> glory free</h1>", content_type="text/html")
 
@@ -3630,6 +3689,30 @@ async def api_device_rotate(request):
         })
     except Exception as e:
         return aiohttp.web.json_response({"ok": False, "error": str(e)}, status=500)
+async def api_match_speed(request):
+    """Dashboard switch: view or change the live match-speed preset."""
+    if request.method == "POST":
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        mode = data.get("mode") or request.query.get("mode")
+        if not mode:
+            return aiohttp.web.json_response(
+                {"ok": False, "error": "mode required"}, status=400)
+        try:
+            apply_match_speed(mode)
+        except ValueError as e:
+            return aiohttp.web.json_response(
+                {"ok": False, "error": str(e)}, status=400)
+    p = MATCH_SPEED_PRESETS[MATCH_SPEED_MODE]
+    return aiohttp.web.json_response({
+        "ok": True, "mode": MATCH_SPEED_MODE,
+        "duration": p["duration"], "idle": p["idle"],
+        "presets": MATCH_SPEED_PRESETS,
+    })
+
+async def start_web_server():
     app = aiohttp.web.Application(middlewares=[_req_logger])
     app.router.add_get("/", serve_index)
     app.router.add_get("/index.html", serve_index)
@@ -3638,6 +3721,8 @@ async def api_device_rotate(request):
     app.router.add_get("/api/state", api_state)
     app.router.add_get("/api/devices", api_devices)
     app.router.add_post("/api/devices/rotate", api_device_rotate)
+    app.router.add_get("/api/match_speed", api_match_speed)
+    app.router.add_post("/api/match_speed", api_match_speed)
     app.router.add_post("/api/create_team", api_create_team)
     app.router.add_post("/api/account/add", api_account_add)
     app.router.add_post("/api/account/delete", api_account_delete)
@@ -3658,6 +3743,7 @@ async def api_device_rotate(request):
 # ==================== MAIN ====================
 async def main():
     print_banner()
+    load_match_speed()   # restore last dashboard-selected speed before workers start
     try:
         await start_web_server()
     except Exception as e:

@@ -159,8 +159,8 @@ def test_payload_device_id():
     check("id stable across calls", again["19"] == dev["device_id"])
     check("crypto constant 57 untouched",
           a["57"] == "7428b253defc164018c604a1ebbfebdf")
-    check("field 25 still matches baseline",
-          a["25"] == (dev["brand"] + " " + dev["model"]).lower(), a["25"])
+    check("field 25 is proven baseline (A2 rollback)",
+          a["25"] == "samsung SM-E135F", a["25"])
     check("no-device fallback still random-format",
           fallback["19"].startswith("Google|")
           and fallback["19"] != dev["device_id"])

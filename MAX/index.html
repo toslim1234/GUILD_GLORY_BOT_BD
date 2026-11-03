@@ -725,6 +725,17 @@ button:active { transform: scale(.97); }
         </div>
         <div class="dist glow">
           <span class="corner tl"></span><span class="corner tr"></span><span class="corner bl"></span><span class="corner br"></span>
+          <h3><i class="fa-solid fa-gauge" style="color:var(--gold);margin-left:8px"></i>Match Speed</h3>
+          <div class="seg" id="speedSeg" style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 6px">
+            <button data-mode="normal">🐢 Normal 300s</button>
+            <button data-mode="fast">🚀 Fast 180s</button>
+            <button data-mode="ultra">⚡ Ultra 120s</button>
+            <button data-mode="turbo">🔥 Turbo 90s</button>
+          </div>
+          <p style="font-size:12px;color:var(--text-dim);margin:2px 0 0 8px" id="speedHint">Change te match duration live update hobe — restart lagbe na.</p>
+        </div>
+        <div class="dist glow">
+          <span class="corner tl"></span><span class="corner tr"></span><span class="corner bl"></span><span class="corner br"></span>
           <h3><i class="fa-solid fa-chart-pie" style="color:var(--teal);margin-left:8px"></i>Account Distribution</h3>
           <div class="bar" id="distBar"></div>
           <div class="legend">
@@ -1217,7 +1228,37 @@ function init() {
   fetchStats();
   if (statsInterval) clearInterval(statsInterval);
   statsInterval = setInterval(() => { if (!document.hidden) fetchStats(); }, 4000);
+  loadSpeed();
 }
+
+/* ============ MATCH SPEED ============ */
+function paintSpeed(mode) {
+  document.querySelectorAll("#speedSeg button").forEach(b => {
+    b.classList.toggle("active", b.dataset.mode === mode);
+  });
+}
+async function loadSpeed() {
+  try {
+    const r = await fetch("/api/match_speed");
+    const d = await r.json();
+    if (d.ok) {
+      paintSpeed(d.mode);
+      const h = $("speedHint");
+      if (h) h.textContent = `Active: ${d.mode.toUpperCase()} → match ${d.duration}s | idle ${Math.round(d.idle)}s | live, no restart needed.`;
+    }
+  } catch (e) {}
+}
+document.querySelectorAll("#speedSeg button").forEach(b => {
+  b.addEventListener("click", () => guard("speed", async () => {
+    const d = await post("/api/match_speed", { mode: b.dataset.mode });
+    if (d.ok) {
+      paintSpeed(d.mode);
+      toast(`Match Speed: ${d.mode.toUpperCase()} (${d.duration}s)`, "success");
+      const h = $("speedHint");
+      if (h) h.textContent = `Active: ${d.mode.toUpperCase()} → match ${d.duration}s | idle ${Math.round(d.idle)}s | live, no restart needed.`;
+    } else toast(d.error || "Failed to set speed", "error");
+  }));
+});
 
 /* ============ API ============ */
 async function post(url, body) {
